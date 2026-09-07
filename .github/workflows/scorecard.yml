@@ -17,9 +17,17 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs of the same ref (CICD §11c). The trailing
+# discriminator keeps that from eating a verdict on main: `pr` coalesces a
+# PR's runs as before, while a push groups per commit SHA so one commit's run
+# can never cancel another's. See ci.yml for the full reasoning.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: true
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write # upload SARIF to code scanning
@@ -41,6 +49,6 @@ jobs:
           path: results.sarif
           retention-days: 5
 
-      - uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+      - uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           sarif_file: results.sarif

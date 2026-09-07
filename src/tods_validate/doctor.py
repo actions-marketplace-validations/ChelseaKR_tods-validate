@@ -7,6 +7,17 @@ run (no companion GTFS, no Java, no gtfs-validator jar) is always labeled
 SKIPPED with a specific reason, never silently dropped, so a report can never
 be misread as "everything passed" when a stage simply did not execute.
 
+The same rule applies one level down, inside the validate stage. It carries the
+run's :class:`RunCoverage`, so a stage marked RAN also states how many of the
+rule set actually ran and names what did not. Without it a TODS-only package --
+16 of 44 checks skipped, 9 of them ERROR-severity -- rendered as "No problems
+found." with nothing to distinguish it from a fully checked feed (#185).
+
+The same rule governs the one document this module reads from another tool.
+gtfs-validator's ``report.json`` is counted only when its shape is fully
+understood; a report that parses as JSON but is shaped some other way is a
+FAILED stage naming what could not be read, never zero notices (#147).
+
 gtfs-validator is invoked only when java and a jar are already available on
 this machine (``--gtfs-validator-jar`` or the ``GTFS_VALIDATOR_JAR`` env var).
 This module never downloads it -- no surprise network access.
@@ -28,7 +39,8 @@ from .findings import Finding, Severity
 from .loader import PackageNotFoundError
 from .merge import merge_feeds
 from .report import render_markdown, render_text, summarize
-from .runner import run
+from .rules import RunCoverage
+from .runner import run_with_coverage
 from .schema import SPEC_VERSION
 from .stats import (
     FeedStats,
@@ -53,6 +65,12 @@ _STAGE_TITLES: dict[str, str] = {
 class ValidatePayload:
     findings: list[Finding]
     source: str
+    # The rule-set coverage manifest for the validate stage. `doctor` marks a
+    # stage that could not run SKIPPED with a reason; without this the stage
+    # that skipped the most -- 16 of 44 checks on a TODS-only package -- was
+    # marked RAN with no qualification, and "No problems found." was the whole
+    # story a reader got (#185).
+    coverage: RunCoverage | None = None
 
 
 @dataclass
@@ -111,6 +129,99 @@ def _run_merge_stage(
         return StageResult(name="merge", status="skipped", reason=str(exc)), None
     payload = MergePayload(written=result.written, output_dir=str(merged_dir))
     return StageResult(name="merge", status="ran", payload=payload), merged_dir
+
+
+@dataclass(frozen=True)
+class _NoticeCounts:
+    """Notice totals read out of a gtfs-validator ``report.json``."""
+
+    errors: int
+    warnings: int
+    infos: int
+    codes: int
+
+
+_JSON_TYPE_NAMES: dict[type, str] = {
+    type(None): "null",
+    bool: "a boolean",
+    int: "a number",
+    float: "a number",
+    str: "a string",
+    list: "an array",
+    dict: "an object",
+}
+
+
+def _json_type(value: object) -> str:
+    """Name a parsed JSON value the way the JSON spec does, for a message."""
+    return _JSON_TYPE_NAMES.get(type(value), type(value).__name__)
+
+
+_COUNTED_SEVERITIES = ("ERROR", "WARNING", "INFO")
+
+
+def _read_notice(index: int, notice: object) -> tuple[str, int] | str:
+    """``(severity, totalNotices)`` for one notice entry, or why it is unreadable."""
+    where = f"notices[{index}]"
+    if not isinstance(notice, dict):
+        return f"{where} is {_json_type(notice)}, not an object"
+    total = notice.get("totalNotices")
+    if isinstance(total, bool) or not isinstance(total, int):
+        return f"{where} has no integer 'totalNotices', so its notices cannot be counted"
+    severity = notice.get("severity")
+    if not isinstance(severity, str) or severity not in _COUNTED_SEVERITIES:
+        return (
+            f"{where} has severity {severity!r}, which this version of tods-validate "
+            "does not know how to count"
+        )
+    return severity, total
+
+
+def _read_gtfs_validator_notices(raw: object) -> _NoticeCounts | str:
+    """Count the notices in a parsed gtfs-validator ``report.json``.
+
+    Returns counts, or a sentence saying why the document could not be read.
+    It never returns counts it had to guess at, and that is the whole point:
+    zero notices read out of a document this code did not understand renders
+    identically to a genuinely clean gtfs-validator run ("0 error notice(s),
+    0 warning notice(s), 0 info notice(s)"), which is exactly the misreading
+    this module exists to prevent. A shape this version does not recognise is
+    a stage that produced no result, so the caller reports it FAILED (#147).
+
+    Being strict costs something and it is the right trade here: if a future
+    gtfs-validator renames the top-level key or adds a fourth severity, this
+    stage stops with a specific reason naming what it did not understand,
+    rather than reporting a merged feed as clean because the counters it knows
+    about all happened to stay at zero.
+    """
+    if not isinstance(raw, dict):
+        return (
+            f"could not read gtfs-validator's report.json: it is valid JSON but "
+            f"{_json_type(raw)}, not an object, so it names no notices."
+        )
+    if "notices" not in raw:
+        return "could not read gtfs-validator's report.json: it has no top-level 'notices' array."
+    notices = raw["notices"]
+    if not isinstance(notices, list):
+        return (
+            f"could not read gtfs-validator's report.json: its top-level 'notices' "
+            f"is {_json_type(notices)}, not an array."
+        )
+
+    tallies = dict.fromkeys(_COUNTED_SEVERITIES, 0)
+    for index, notice in enumerate(notices):
+        entry = _read_notice(index, notice)
+        if isinstance(entry, str):
+            return f"could not read gtfs-validator's report.json: {entry}."
+        severity, total = entry
+        tallies[severity] += total
+
+    return _NoticeCounts(
+        errors=tallies["ERROR"],
+        warnings=tallies["WARNING"],
+        infos=tallies["INFO"],
+        codes=len(notices),
+    )
 
 
 def _run_gtfs_validator_stage(  # noqa: C901 - stage has several user-facing skip/fail exits
@@ -184,29 +295,15 @@ def _run_gtfs_validator_stage(  # noqa: C901 - stage has several user-facing ski
             reason=f"could not parse gtfs-validator report.json: {exc}",
         )
 
-    notices: list[object] = raw.get("notices", []) if isinstance(raw, dict) else []
-    error_notices = 0
-    warning_notices = 0
-    info_notices = 0
-    for notice in notices:
-        if not isinstance(notice, dict):
-            continue
-        total = notice.get("totalNotices", 0)
-        if not isinstance(total, int):
-            continue
-        severity = notice.get("severity")
-        if severity == "ERROR":
-            error_notices += total
-        elif severity == "WARNING":
-            warning_notices += total
-        elif severity == "INFO":
-            info_notices += total
+    counted = _read_gtfs_validator_notices(raw)
+    if isinstance(counted, str):
+        return StageResult(name=name, status="failed", reason=counted)
 
     payload = GtfsValidatorPayload(
-        error_notices=error_notices,
-        warning_notices=warning_notices,
-        info_notices=info_notices,
-        notice_codes=len(notices),
+        error_notices=counted.errors,
+        warning_notices=counted.warnings,
+        info_notices=counted.infos,
+        notice_codes=counted.codes,
         report_dir=str(report_dir),
     )
     return StageResult(name=name, status="ran", payload=payload)
@@ -241,15 +338,21 @@ def run_doctor(
     skipped rather than aborting the whole pass, and ``stats`` failing to load
     its own package is recorded as a failed stage instead of raising.
     """
-    package, findings = run(path, gtfs_path, enabled=enabled, encoding=encoding)
+    package, findings, coverage = run_with_coverage(
+        path, gtfs_path, enabled=enabled, encoding=encoding
+    )
     if ignore:
         findings = [f for f in findings if f.rule_id not in ignore]
+        # Same disclosure `validate` makes: a rule whose findings were withheld
+        # by --ignore is reclassified rather than quietly counted as having run
+        # clean.
+        coverage = coverage.with_ignored(ignore)
 
     stages: list[StageResult] = [
         StageResult(
             name="validate",
             status="ran",
-            payload=ValidatePayload(findings=findings, source=package.source),
+            payload=ValidatePayload(findings=findings, source=package.source, coverage=coverage),
         )
     ]
 
@@ -305,7 +408,7 @@ def render_doctor_text(report: DoctorReport) -> str:
         lines.append(f"== {title}: {_marker(stage)} ==")
         payload = stage.payload
         if isinstance(payload, ValidatePayload):
-            lines.append(render_text(payload.findings, payload.source))
+            lines.append(render_text(payload.findings, payload.source, coverage=payload.coverage))
         elif isinstance(payload, MergePayload):
             lines.append(f"Wrote {len(payload.written)} file(s) to a temporary merged GTFS feed.")
         elif isinstance(payload, GtfsValidatorPayload):
@@ -329,7 +432,9 @@ def render_doctor_markdown(report: DoctorReport, *, stamp: bool = False) -> str:
         payload = stage.payload
         body: str | None = None
         if isinstance(payload, ValidatePayload):
-            body = _strip_leading_heading(render_markdown(payload.findings, payload.source))
+            body = _strip_leading_heading(
+                render_markdown(payload.findings, payload.source, coverage=payload.coverage)
+            )
         elif isinstance(payload, MergePayload):
             body = f"Wrote {len(payload.written)} file(s) to a temporary merged GTFS feed."
         elif isinstance(payload, GtfsValidatorPayload):
@@ -371,6 +476,8 @@ def doctor_to_dict(report: DoctorReport) -> dict[str, object]:
             entry["warnings"] = counts[Severity.WARNING]
             entry["infos"] = counts[Severity.INFO]
             entry["findings"] = [f.to_dict() for f in payload.findings]
+            if payload.coverage is not None:
+                entry["coverage"] = payload.coverage.to_dict()
         elif isinstance(payload, MergePayload):
             entry["written"] = payload.written
         elif isinstance(payload, GtfsValidatorPayload):

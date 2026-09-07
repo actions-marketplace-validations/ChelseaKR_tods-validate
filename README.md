@@ -1,9 +1,9 @@
 # tods-validate
 
-Status: Beta
-
 A validator for [Transit Operational Data Standard (TODS)](https://tods-transit.org/)
 feeds, with a CLI and a GitHub Action.
+
+Status: Beta
 
 TODS is an open standard for describing scheduled transit operations: crew
 runs, deadheads, vehicle assignments, and other non-public service that GTFS
@@ -34,7 +34,7 @@ runs locally in your browser; feed files are not uploaded.
 
 ## Install
 
-Requires Python 3.11 or newer.
+Requires Python 3.12 or newer.
 
 ```sh
 pipx install tods-validate
@@ -61,17 +61,28 @@ tods-validate exports/tods/ --gtfs exports/gtfs.zip
 ```
 
 When the TODS files sit next to the GTFS files in one package, the GTFS files
-are picked up automatically. A complete sample feed ships in this repo, so you
-can try it right after installing:
+are picked up automatically — but only the files TODS IDs actually resolve
+against (`trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`,
+`calendar.txt`, `calendar_dates.txt`). A package holding none of those is not
+treated as its own companion feed, and a check that reads a file the companion
+does not have is reported as skipped, never as a rule that ran clean. A stray
+`agency.txt` cannot answer whether a `trip_id` exists, so it is not allowed to
+look like it did. A complete sample feed ships in this repo, so you can try it
+right after installing:
 
 ```console
 $ tods-validate examples/sample-feed
 tods-validate: examples/sample-feed (TODS v2.1.0)
 
 No problems found.
+Rule-set coverage: 41 of 45 checks ran. Checks skipped: 4 opt-in rule not enabled (use --enable).
+  Not run, opt-in rule not enabled (use --enable) (4 INFO): TODS-I501, TODS-I502, TODS-I601, TODS-I602
 $ echo $?
 0
 ```
+
+A clean report always says what it covered; see
+[Rule-set coverage](#rule-set-coverage).
 
 On a feed with problems, each finding names the file, row, field, and what good
 looks like:
@@ -91,14 +102,47 @@ The exit code is 0 when no errors are found, 1 when there are errors, and 2
 when the package cannot be read at all. Warnings do not fail the run unless
 you pass `--fail-on warning`.
 
+## Rule-set coverage
+
+Not every check applies to every run. A feed validated without a companion
+GTFS feed cannot resolve a `trip_id`, so the 16 rules that read GTFS files do
+not run; opt-in rules stay off until `--enable` turns them on; `--ignore`
+withholds a rule's findings; `--spec-version` narrows the catalog.
+
+Every report says which of those happened, and names the rules:
+
+```console
+$ tods-validate validate exports/tods
+tods-validate: exports/tods (TODS v2.1.0)
+
+No problems found.
+Rule-set coverage: 27 of 45 checks ran. Checks skipped: 16 no companion GTFS feed was provided; 2 opt-in rule not enabled (use --enable).
+  Not run, no companion GTFS feed was provided (9 ERROR, 5 WARNING, 2 INFO): TODS-I501, TODS-I502, TODS-E205, TODS-E307, TODS-E308, TODS-E309, TODS-E310, TODS-W315, TODS-W316, TODS-E311, TODS-E312, TODS-W313, TODS-E314, TODS-E405, TODS-W406, TODS-W407
+  Not run, opt-in rule not enabled (use --enable) (2 INFO): TODS-I601, TODS-I602
+```
+
+A run that skipped nothing says so, rather than staying silent: `Rule-set
+coverage: Every applicable check ran (45 of 45).` Silence would be ambiguous,
+so there is none.
+
+**A skipped check does not change the exit code.** A partial run still exits
+0, because that is what every release since 0.1.0 has done and pipelines gate
+on it. Pass `--require-complete-run` to exit 1 instead when a check could not
+run because an input was missing, such as a companion GTFS feed that was not
+given. Skips you asked for (`--ignore`, opt-in rules left off, `--spec-version`
+scoping) do not fail that gate; they are still disclosed.
+
 Other output formats:
 
-- `--format json` prints a stable JSON document for tooling.
+- `--format json` prints a stable JSON document for tooling. Its `coverage`
+  block carries the same manifest, per rule, in machine form.
 - `--format markdown` prints a report suitable for pasting into an issue
   (`--stamp` adds a provenance footer for a citable compliance artifact).
-- `--format github` prints GitHub Actions workflow annotations.
+- `--format github` prints GitHub Actions workflow annotations. Each reason a
+  check did not run becomes its own `::notice` annotation, so the disclosure
+  appears in the pull request and not just in the log.
 - `--format sarif` prints SARIF for GitHub code-scanning and security
-  dashboards.
+  dashboards; the manifest rides under `invocations`.
 - `--format html` prints a standalone, shareable report. Add `--timeline` to
   include a visual time rail and equivalent event table for each run.
 
@@ -163,7 +207,10 @@ be passed with `--config path/to/file.toml`. A config may also `extends =
 A third preset, `ingest-ready`, is for a downstream CAD/AVL system deciding
 whether to import a feed at all: it is at least as strict as `strict` (fails
 on warnings, enables `coverage` and `advisory`) and adds no ignores, so it
-doubles as a go/no-go gate rather than an authoring-time policy.
+doubles as a go/no-go gate rather than an authoring-time policy. Today it
+resolves to exactly the same settings as `strict`; it is a separate name
+because the two answer different questions, and a later change to one should
+not silently move the other.
 
 Some checks are off by default because they surface judgement calls rather than
 spec violations. Turn them on with `--enable coverage` (which GTFS trips have no
@@ -215,7 +262,7 @@ package first so the merge rests on clean inputs.
 A CI job that checks the merged feed with MobilityData's gtfs-validator:
 
 ```yaml
-- uses: ChelseaKR/tods-validate@v0.8.0
+- uses: ChelseaKR/tods-validate@v0.10.0
   with:
     path: feed/tods
     gtfs: feed/gtfs
@@ -235,9 +282,16 @@ feed, stats — as one command with a single combined report. gtfs-validator is
 never downloaded automatically: without java or a jar (`--gtfs-validator-jar`
 or `GTFS_VALIDATOR_JAR`) already available, that stage is labeled SKIPPED
 with the reason ("merged-feed GTFS validity NOT checked"), never silently
-treated as a pass. `doctor` exits non-zero on validate findings at
-`--fail-on` severity or a gtfs-validator stage that actually failed to run,
-not on one that was honestly skipped.
+treated as a pass. A `report.json` gtfs-validator wrote but this version
+cannot read is labeled FAILED, naming what it could not read, rather than
+counted as zero notices; zero notices out of an unreadable document would
+render exactly like a clean merged feed. The validate stage carries the same
+`Rule-set coverage:` manifest a bare `tods-validate` run prints, in all three
+formats, so a stage marked RAN also states how much of the rule set ran.
+`doctor` exits non-zero on validate findings at `--fail-on` severity or a
+gtfs-validator stage that actually failed to run, not on one that was honestly
+skipped; `--require-complete-run` adds the same opt-in gate it provides on
+`validate` and `batch`.
 
 ## Other subcommands
 
@@ -250,7 +304,11 @@ not on one that was honestly skipped.
   path among several is reported in place rather than aborting the rest.
 - `tods-validate diff old/ new/` validates two versions of a feed and reports
   which findings were fixed, newly introduced, or still present; it exits
-  non-zero only on newly introduced errors, which is useful in review.
+  non-zero only on newly introduced errors, which is useful in review. An
+  OLD finding absent from NEW is reported "fixed" only when its rule
+  actually ran in NEW — one that stopped running (a dropped or newly
+  unreadable companion GTFS feed, most often) lands in a separate "unknown"
+  bucket instead, and any rule that ran in OLD but not NEW is named.
 - `tods-validate drift old-gtfs/ new-gtfs/ --tods feed/` diagnoses the "your
   GTFS moved under your TODS" failure directly: given a TODS package and two
   versions of its companion GTFS feed, it reports exactly which referenced
@@ -259,6 +317,19 @@ not on one that was honestly skipped.
   unambiguous close match (never applied automatically — a hint to review).
   Exits non-zero if anything broke, so it can gate a GTFS update before it
   reaches production.
+- `tods-validate pickdiff old/ new/` compares two packages by the spec's own
+  primary keys and reports what changed in the operational data, which
+  neither `diff` (findings) nor `drift` (the companion GTFS) does: runs added
+  and removed, rows added, removed and changed with their old and new values,
+  events changed per run, and the revenue/non-revenue minutes delta.
+  Reordering a file is not a difference. It produces no findings and judges no
+  change correct. `--anonymize` pseudonymizes employee and vehicle
+  identifiers, one salt per run applied to both sides, so a report can be
+  shared. It exits 2 rather than 0 when the comparison could not be finished
+  — an unreadable file, or a duplicate primary key whose later rows were
+  matched against nothing — because neither establishes that the pick is
+  unchanged, and an unreadable `run_events.txt` reported as an empty one would
+  announce every run in the pick as removed.
 - `tods-validate batch a/ b/ c/` validates several feeds and prints a roll-up
   table (`--format json` for tooling).
 - `tods-validate batch a/ b/ --history .tods-history/` additionally appends
@@ -268,8 +339,12 @@ not on one that was honestly skipped.
   .tods-history/` then prints a text-first Markdown table, grouped by feed
   ("agency"), showing each run's counts and any per-rule regression since the
   same feed's previous run — "which agency regressed" answerable straight
-  from CI history. **Privacy:** a history record stores only counts and rule
-  IDs, never finding messages, since messages can carry stop, run, or
+  from CI history. Each record also carries that run's rule-set coverage, so
+  the table states the scope every run had and never reports a rule that
+  stopped running as a fix: when a rule that found something last time did not
+  execute this time, the Δ column reads `?` and names the rule instead of
+  claiming a reduction. **Privacy:** a history record stores only counts and
+  rule IDs, never finding messages, since messages can carry stop, run, or
   employee/vehicle identifiers; see the docstring in `workspace.py`. Set
   `[workspace]` `history-dir` in `tods-validate.toml` to avoid repeating
   `--history` in every job (CLI flag still wins over the config value).
@@ -328,11 +403,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ChelseaKR/tods-validate@v0.8.0
+      - uses: ChelseaKR/tods-validate@v0.10.0
         with:
           path: feed/tods
           gtfs: feed/gtfs        # omit if GTFS files sit next to the TODS files
 ```
+
+The action runs `--format github`, so the annotations it leaves on the pull
+request include the checks that did not run and why (see
+[Rule-set coverage](#rule-set-coverage)). Leaving `gtfs`
+out is the case worth knowing about: the 16 checks that read GTFS files cannot
+run, 9 of them ERROR-severity, and the job still passes. Add
+`require-complete-run: "true"` to fail it instead.
 
 The action installs `tods-validate` from a hash-verified
 [`requirements-action.lock`](requirements-action.lock) (`pip install
@@ -392,21 +474,46 @@ non-color users.
   marker in addition to color. The report ships as a single file with no
   external assets.
 
+- The blocking WCAG 2.1 AA check (axe + HTML_CodeSniffer) runs against this
+  repository's `web/index.html` and a generated HTML report on every pull
+  request. The *deployed* playground is a separate artifact and is checked
+  separately: after each deploy and weekly, the live page is compared against
+  the page this repository publishes and audited with the same runners. A page
+  that is accessible in the repository is not evidence about the page you open,
+  so both are checked.
+
+- The rule catalog published at `web/rules/` is audited by the same runners.
+  It was not until 2026-08-27, and entering the gate it failed with 184 errors
+  in one shared stylesheet; see the statement below for what and why.
+
+[`docs/a11y/STATEMENT.md`](docs/a11y/STATEMENT.md) is the dated statement: the
+WCAG 2.1 AA target, a surface-by-surface table of what has actually been
+checked and by what, and the gaps automation cannot close. It deliberately
+makes no conformance *claim*, because no assistive-technology evaluation has
+been done.
+
 If you hit an output that is hard to read with assistive technology, that is a
 bug — please report it.
 
 ## Observability
 
-Observability: Tier C — OTel tracing out-of-scope (no network surface). Opt-in
---log-format json only.
+Observability: Tier C. OpenTelemetry tracing is out of scope, because there is
+no network surface to trace.
+
+The tier also asks for an opt-in `--log-format json` flag, and that flag does
+not exist. It is not an oversight that a release would quietly carry: the
+package emits no log records at all (nothing under `src/` imports `logging`),
+so a flag to choose their format would be a claim rather than a capability.
+What is machine-readable here is the report, through `--format json`, `--format
+sarif`, and the schema at [docs/report.schema.json](docs/report.schema.json).
+That is a different thing from a log stream, and this section previously
+conflated them. Tracked in
+[docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#observability).
 
 ## Standards Conformance
 
-`tods-validate` is developed against a shared set of engineering standards
-(code quality, security & supply chain, CI/CD, release & versioning,
-accessibility, observability, documentation, quality & metrics,
-responsible-tech, internationalization, AI-evaluation). Applicability and
-current state:
+`tods-validate` is developed against the fifteen portfolio standards below.
+Applicability and current state:
 
 | Standard | Applies? | State |
 |---|---|---|
@@ -414,11 +521,15 @@ current state:
 | Security & Supply-Chain | Applies (ships code, parses untrusted input) | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#security-and-supply-chain) |
 | CI-CD | Applies | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#ci-cd) |
 | RELEASE-AND-VERSIONING | Applies (PyPI + GHCR + GitHub Releases + Action) | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#release-and-versioning) |
-| ACCESSIBILITY | Applies, scoped to `--format html` report + `web/` playground | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#accessibility) |
-| OBSERVABILITY | Applies at Tier C (see `## Observability` above) | Applies — Tier C; N/A — tracing has no network surface, as declared above |
+| ACCESSIBILITY | Applies (scoped to the `--format html` report and the `web/` playground) | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#accessibility) |
+| OBSERVABILITY | Applies at Tier C (see `## Observability` above) | Applies — Tier C; tracing N/A (no network surface); the tier's `--log-format json` is a gap, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#observability) |
 | INTERNATIONALIZATION | N/A — no user-facing strings requiring translation | N/A — see [docs/I18N.md](docs/I18N.md) |
+| AI Development Measurement | Applies | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#ai-development-measurement) |
 | AI Evaluation | N/A — no LLM/AI runtime | N/A — no LLM SDK or generative/agentic component anywhere in `src/` or `scripts/`; deterministic rule engine only |
+| Data Governance | Applies (validates user-supplied transit data) | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#data-governance) |
 | DOCUMENTATION | Applies | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#documentation) |
+| Incident Response | Applies (published CLI, Action, packages, and containers) | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#incident-response) |
+| Performance | Applies (CLI hot path and shipped HTML playground/report) | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#performance) |
 | QUALITY-AND-METRICS | Applies | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#quality-and-metrics) |
 | Responsible-Tech Framework | Applies | Applies — gap tracked, see [docs/CONFORMANCE-GAPS.md](docs/CONFORMANCE-GAPS.md#responsible-tech) |
 
@@ -433,7 +544,7 @@ create` away; see that file's header).
 git clone https://github.com/ChelseaKR/tods-validate
 cd tods-validate
 python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e . --group dev
 pytest
 ```
 
@@ -447,3 +558,8 @@ fixture/conformance contract.
 ## License
 
 Apache-2.0, matching the TODS specification repository.
+
+## Support
+
+This is independent, unpaid work. If it has been useful to you, you can
+<a href='https://ko-fi.com/T6T6GMYTU' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>

@@ -7,7 +7,7 @@ count.
 
 ## Setup
 
-Requires Python 3.11 or newer. Dependencies are locked with
+Requires Python 3.12 or newer. Dependencies are locked with
 [uv](https://docs.astral.sh/uv/); CI installs from `uv.lock` with
 `uv sync --frozen`, which also fails the build if the lockfile has drifted
 from `pyproject.toml` (CQ-09). Using uv locally keeps your environment
@@ -16,14 +16,16 @@ identical to CI's:
 ```sh
 git clone https://github.com/ChelseaKR/tods-validate
 cd tods-validate
-uv sync --extra dev
+uv sync --group dev
 . .venv/bin/activate
 pre-commit install
 ```
 
-`pip install -e ".[dev]"` into your own venv still works if you would rather
-not install uv; just regenerate `uv.lock` (`uv lock`) and commit it in the
-same PR if you touch dependencies, so CI's lockfile-drift check stays green.
+`pip install -e . --group dev` into your own venv still works if you would
+rather not install uv (development dependencies are a PEP 735 dependency
+group, which pip reads with `--group` from 25.1 onward, not an extra); just
+regenerate `uv.lock` (`uv lock`) and commit it in the same PR if you touch
+dependencies, so CI's lockfile-drift check stays green.
 
 ## The local gate
 
@@ -39,8 +41,8 @@ coverage included), the `docs/rules.md` drift check, the i18n N/A
 declaration check, `pip-audit --strict`, and a `gitleaks` secret scan. Run a
 single stage with its own target (`make lint`, `make test`, `make audit`,
 `make secrets`, ...); see the [Makefile](Makefile). Requires `pip-audit` and
-`gitleaks` on `PATH` in addition to the `dev` extra
-(`pip install -e ".[dev]"`; `gitleaks` is a Go binary, see
+`gitleaks` on `PATH` in addition to the `dev` dependency group
+(`pip install -e . --group dev`; `gitleaks` is a Go binary, see
 [github.com/gitleaks/gitleaks#installing](https://github.com/gitleaks/gitleaks#installing)).
 
 `pre-commit` runs ruff, ruff-format, mypy, and gitleaks on staged files, so

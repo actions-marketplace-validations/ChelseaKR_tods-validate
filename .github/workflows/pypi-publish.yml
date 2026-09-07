@@ -4,7 +4,15 @@ name: Publish to PyPI
 # No API token is stored anywhere; PyPI verifies this workflow's identity.
 # One-time setup on PyPI: add a GitHub trusted publisher for project
 # "tods-validate" pointing at owner ChelseaKR, repo tods-validate,
-# workflow "pypi-publish.yml" (environment left blank).
+# workflow "pypi-publish.yml", environment "pypi" (CICD-06).
+#
+# The environment is the second half of the scoping. Without it, any workflow
+# in this repository that can mint an OIDC token can publish; with it, PyPI
+# accepts only a token minted by the `pypi` environment, which the repository
+# can restrict independently. Order matters when changing this: PyPI treats a
+# blank environment as "any", so adding the line below is safe on its own, and
+# setting the environment on PyPI is what starts enforcing it. Do it in that
+# order, or a release will fail to publish.
 #
 # Supply-chain hardening (SECURITY-AND-SUPPLY-CHAIN-STANDARD Section 6):
 #   - CycloneDX 1.7 SBOM for the built wheel/sdist, blocking (Section 6.2).
@@ -18,6 +26,11 @@ name: Publish to PyPI
 # `verify-published` then re-downloads what was actually published and
 # checks its provenance attestation, so a "succeeded" run means the artifact
 # on PyPI is the one that was verified, not merely that upload didn't error.
+#
+# `deploy-playground` runs last: the GitHub Pages playground pins the wheel
+# this workflow publishes, so its deploy is sequenced after the wheel is
+# confirmed on PyPI rather than triggered by the release event it used to
+# race (and lose, on v0.8.0 and v0.9.0 -- see pages.yml).
 
 on:
   release:
@@ -42,6 +55,16 @@ jobs:
   publish:
     needs: [verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Scopes the OIDC token PyPI accepts (CICD-06). See the header for why the
+    # PyPI side has to be changed after this, not before.
+    #
+    # The environment's deployment branch policy admits the tag pattern `v*`
+    # and nothing else, so `workflow_dispatch` from a branch is refused here
+    # rather than partway through a publish. Dispatch from a version tag.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tods-validate/
     permissions:
       contents: write # attach the SBOM to the GitHub release
       id-token: write # OIDC for PyPI Trusted Publishing + provenance
@@ -50,7 +73,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade build
@@ -82,12 +105,12 @@ jobs:
 
       # SLSA build provenance for the wheel + sdist (Section 6.4, SLSA Build L2).
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "dist/*"
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
       # Attach the SBOM to the GitHub release for consumer verification.
       - name: Upload SBOM to the release
@@ -106,13 +129,14 @@ jobs:
     needs: [publish]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
       - name: Wait for the index to pick up the new release
@@ -128,3 +152,21 @@ jobs:
           for f in dist-published/*; do
             gh attestation verify "$f" --owner ChelseaKR
           done
+
+  deploy-playground:
+    # The playground micropip-installs the exact wheel published above, so it
+    # deploys only after `verify-published` has confirmed that wheel is really
+    # on PyPI. Deploying on the release event raced this upload and lost on
+    # v0.8.0 and v0.9.0: pages.yml's guard fired seconds after the release was
+    # published, long before the wheel existed, and the live page stayed on
+    # the previous release. `needs` makes that ordering structural. The guard
+    # in pages.yml still runs, so if PyPI somehow stops serving the wheel the
+    # deploy fails naming it rather than publishing a page that cannot
+    # install itself.
+    needs: [verify-published]
+    if: github.event_name == 'release'
+    permissions:
+      contents: read
+      pages: write # publish the built site to GitHub Pages
+      id-token: write # OIDC to prove the deploying workflow produced the artifact
+    uses: ./.github/workflows/pages.yml

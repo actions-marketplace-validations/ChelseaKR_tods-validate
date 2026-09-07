@@ -1,0 +1,103 @@
+name: Playground deployment check
+
+# The deployed playground is a shipped artifact, and nothing was checking it.
+# It sat at v0.7.0 for three weeks after web/index.html moved to v0.8.0, so the
+# README's "try it without installing anything" path validated with the previous
+# release's rule set, and the blocking WCAG 2.1 AA gate in ci.yml passed the
+# whole time -- it audits a copy of web/index.html from a temp directory, which
+# is the source of the deployment, not the deployment.
+#
+# Three things are checked, all against the live page:
+#
+# 1. Drift: the served index.html must be byte-identical to web/index.html on
+#    the default branch, which is the page this repository publishes. This used
+#    to compare against the most recent release tag, which was wrong: the tag
+#    is not what workflow_dispatch deploys, and a tag is immutable, so the one
+#    that shipped a stale pin (v0.10.0, still pinned to 0.9.0 -- see #142) held
+#    this check red against a deployment that was correct. See the commentary
+#    in scripts/check-deployed-playground.sh.
+# 2. Boot and validate: the page is driven in a real browser until it has
+#    loaded Pyodide, micropip-installed its pinned wheel from PyPI, and
+#    rendered a report for a synthetic broken fixture, then for the valid
+#    fixture, which must come back with no findings. Both halves are needed:
+#    a page that answered everything with findings would pass the broken run
+#    on its own. Checks 1 and 3 are both satisfied by a page that is
+#    byte-perfect, accessible, and broken for every visitor -- which this
+#    project has shipped (#136). Nothing verified the playground actually
+#    runs until this job existed (#146).
+# 3. Accessibility: pa11y-ci (axe + HTML_CodeSniffer, WCAG2AA) against the live
+#    URL, so the page people actually open is held to the standard the
+#    repository copy is already held to. Note that it loads the page with
+#    ?a11y-static=1, which deliberately skips the Pyodide boot: it audits the
+#    static rendering and is not evidence that the playground works.
+#
+# Weekly and on demand. pages.yml runs the same three checks immediately after
+# it deploys, so a deploy that silently failed to take effect is caught there.
+# None is a pull-request gate: a PR that edits web/index.html is *supposed*
+# to differ from what is deployed until it merges and is deployed.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1" # Mondays, 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playground-deployment
+  cancel-in-progress: false
+
+jobs:
+  # The byte comparison that used to be this workflow's `drift` job now lives in
+  # live-integrity.yml. It moved because it needs no browser and can therefore run
+  # daily rather than weekly, and because it now walks the whole tracked `web` tree
+  # instead of comparing web/index.html alone. The two jobs below still need Chrome,
+  # so they stay on the weekly cadence they were written for.
+  boots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Select the hosted Chrome binary
+        run: |
+          boot_chrome="$(command -v google-chrome)"
+          test -x "$boot_chrome"
+          echo "PUPPETEER_EXECUTABLE_PATH=$boot_chrome" >> "$GITHUB_ENV"
+      - name: Boot the deployed page and validate a broken and a clean feed through it
+        run: |
+          set -euo pipefail
+          # The pin this repository publishes. The live page must not merely
+          # boot, it must boot on the release the repository stands behind.
+          pin="$(sed -n 's/.*TODS_VALIDATE_VERSION = "\([^"]*\)".*/\1/p' web/index.html | head -1)"
+          test -n "$pin"
+          PLAYGROUND_EXPECTED_PIN="$pin" node scripts/check-playground-boots.cjs
+
+  accessibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Select the hosted Chrome binary
+        run: |
+          a11y_chrome="$(command -v google-chrome)"
+          test -x "$a11y_chrome"
+          echo "PUPPETEER_EXECUTABLE_PATH=$a11y_chrome" >> "$GITHUB_ENV"
+      - name: Audit the deployed page (WCAG 2.1 AA)
+        run: ./node_modules/.bin/pa11y-ci --config scripts/pa11y-ci-live.cjs

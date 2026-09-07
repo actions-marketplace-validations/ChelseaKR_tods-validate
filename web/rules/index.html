@@ -4,17 +4,56 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>tods-validate rule catalog</title>
+    <meta name="description" content="Every rule tods-validate checks against TODS v2.1.0, one permanent page per rule ID. These are the URLs SARIF helpUri, editor hovers and CI annotations link back to." />
+    <!-- The rule below asks for a Subresource Integrity hash on a
+         subresource the browser fetches and executes. A canonical link is
+         not one: it is metadata, it starts no fetch, and integrity is not
+         defined on it. Suppressed at this tag only, never repository-wide;
+         the reasoning is in scripts/generate_rules_doc.py.
+         nosemgrep: html.security.audit.missing-integrity.missing-integrity -->
+    <link rel="canonical" href="https://chelseakr.github.io/tods-validate/rules/index.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:site_name" content="tods-validate" />
+    <meta property="og:url" content="https://chelseakr.github.io/tods-validate/rules/index.html" />
+    <meta property="og:title" content="tods-validate rule catalog" />
+    <meta property="og:description" content="Every rule tods-validate checks against TODS v2.1.0, one permanent page per rule ID. These are the URLs SARIF helpUri, editor hovers and CI annotations link back to." />
+    <meta property="og:image" content="https://chelseakr.github.io/tods-validate/og-card.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="tods-validate: validate TODS feeds everywhere. CLI, CI, browser, editor, pre-commit, Docker, and LSP." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://chelseakr.github.io/tods-validate/og-card.png" />
+    <meta name="twitter:image:alt" content="tods-validate: validate TODS feeds everywhere. CLI, CI, browser, editor, pre-commit, Docker, and LSP." />
     <style>
-      :root { color-scheme: light dark; }
+      :root {
+        color-scheme: light dark;
+        --fg: #1a1a1a;
+        --bg: #ffffff;
+        --muted: #595959;
+        --link: #0b4fa8;
+        --line: #6b6b6b;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e8e8e8;
+          --bg: #121212;
+          --muted: #a8a8a8;
+          --link: #8ab4f8;
+          --line: #9a9a9a;
+        }
+      }
       body {
         font: 16px/1.5 system-ui, sans-serif;
         max-width: 40rem;
         margin: 2rem auto;
         padding: 0 1rem;
+        color: var(--fg);
+        background: var(--bg);
       }
       h1 { margin-bottom: 0.25rem; font-size: 1.5rem; }
       h2 { margin-top: 2rem; font-size: 1.1rem; }
-      .lede, .meta, .id { color: #666; }
+      .lede, .meta, .id { color: var(--muted); }
       .id { font-family: ui-monospace, monospace; margin: 0; }
       .meta { margin: 0.5rem 0 1rem; }
       .badge {
@@ -23,12 +62,10 @@
         font-weight: 600;
         padding: 0.1rem 0.5rem;
         border-radius: 999px;
-        border: 1px solid #888;
+        border: 1px solid var(--line);
         margin-right: 0.4rem;
       }
-      nav a, .rule-list a { text-decoration: none; }
-      nav a:hover, .rule-list a:hover { text-decoration: underline; }
-      a { color: inherit; }
+      a { color: var(--link); text-decoration: underline; }
       code { background: rgba(127, 127, 127, 0.15); padding: 0 0.25rem; border-radius: 3px; }
       ul.rule-list { list-style: none; padding-left: 0; }
       ul.rule-list li { padding: 0.25rem 0; }
@@ -52,6 +89,7 @@
       <li><a href="TODS-E106.html"><code>TODS-E106</code></a> &mdash; Required column is missing <span class="badge">ERROR</span></li>
       <li><a href="TODS-W107.html"><code>TODS-W107</code></a> &mdash; Column is not defined by TODS <span class="badge">WARNING</span></li>
       <li><a href="TODS-I108.html"><code>TODS-I108</code></a> &mdash; Supplement column is not defined by GTFS or TODS <span class="badge">INFO</span></li>
+      <li><a href="TODS-W109.html"><code>TODS-W109</code></a> &mdash; File belongs to a different TODS spec version <span class="badge">WARNING</span></li>
     </ul>
 
     <h2>Field values (TODS-x2xx)</h2>
@@ -62,12 +100,13 @@
       <li><a href="TODS-E204.html"><code>TODS-E204</code></a> &mdash; Duplicate primary key <span class="badge">ERROR</span></li>
       <li><a href="TODS-E205.html"><code>TODS-E205</code></a> &mdash; vehicle_assignments needs service_id to be unambiguous <span class="badge">ERROR</span></li>
       <li><a href="TODS-W206.html"><code>TODS-W206</code></a> &mdash; Value has leading or trailing spaces <span class="badge">WARNING</span></li>
+      <li><a href="TODS-E207.html"><code>TODS-E207</code></a> &mdash; Value is not a valid color <span class="badge">ERROR</span></li>
     </ul>
 
     <h2>References between files (TODS-x3xx)</h2>
     <ul class="rule-list">
       <li><a href="TODS-E301.html"><code>TODS-E301</code></a> &mdash; Employee assignment points to a run that does not exist <span class="badge">ERROR</span></li>
-      <li><a href="TODS-W302.html"><code>TODS-W302</code></a> &mdash; Referenced file is missing, references not checked <span class="badge">WARNING</span></li>
+      <li><a href="TODS-W302.html"><code>TODS-W302</code></a> &mdash; Referenced file is missing or was not read in full, references not checked <span class="badge">WARNING</span></li>
       <li><a href="TODS-E303.html"><code>TODS-E303</code></a> &mdash; Vehicle assignment points to a vehicle that does not exist <span class="badge">ERROR</span></li>
       <li><a href="TODS-E304.html"><code>TODS-E304</code></a> &mdash; Supplement both deletes and redefines the same row <span class="badge">ERROR</span></li>
       <li><a href="TODS-W305.html"><code>TODS-W305</code></a> &mdash; Supplement updates the same row more than once <span class="badge">WARNING</span></li>
@@ -106,6 +145,7 @@
     <h2>Advisory (opt-in) (TODS-x6xx)</h2>
     <ul class="rule-list">
       <li><a href="TODS-I601.html"><code>TODS-I601</code></a> &mdash; Run has a long span with no break event <span class="badge">INFO</span></li>
+      <li><a href="TODS-I602.html"><code>TODS-I602</code></a> &mdash; One value is spelled more than one way <span class="badge">INFO</span></li>
     </ul>
   </body>
 </html>

@@ -15,7 +15,72 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src https://cdn.jsdelivr.net https://files.pythonhosted.org https://pypi.org; img-src 'self' data:; frame-src 'self'; worker-src blob:; child-src blob:;"
     />
-    <title>tods-validate playground</title>
+    <title>tods-validate playground: check a TODS feed in your browser</title>
+    <!--
+      The description below is the lede, and nothing the lede does not say.
+      No rule count, no conformance level, no coverage claim: the rule set
+      moves with the spec, docs/rules.md is generated from the registry, and
+      tests/test_readme_claims.py holds the README's figures to it, so a
+      number here would be a copy nothing derives. It also does not suggest
+      that Cal-ITP, MobilityData or the TODS working group have anything to do
+      with this. See NOTICE.
+
+      Every absolute URL carries /tods-validate/. GitHub Pages serves this
+      page at a path under chelseakr.github.io, which five sibling projects
+      also publish under, and https://chelseakr.github.io/ is itself a 404, so
+      a canonical naming the bare origin would tell a crawler that six
+      unrelated projects are one page. A root-relative href would be the same
+      mistake in the other direction: it would resolve to another project or
+      to nothing. tests/test_playground.py fails on either.
+    -->
+    <meta
+      name="description"
+      content="Validate a Transit Operational Data Standard (TODS) feed in your browser. Nothing is uploaded: the validator runs on your machine via Pyodide, so it is safe for non-public operational data."
+    />
+    <!-- Semgrep's missing-integrity rule fires on the tag below, and the
+         finding is a false positive. The rule is about Subresource Integrity,
+         a hash on a subresource the browser fetches and executes so that
+         substituted bytes fail closed; its pattern matches every link whose
+         href carries a scheme, whatever the rel, and already excludes
+         preconnect. A canonical link is the same case: it names which URL
+         this page is, for a crawler, the browser fetches nothing from it
+         (measured in Chrome, request by request), and integrity is not
+         defined on it, so no hash would be accepted. Suppressed at this tag
+         and nowhere else, because the Pyodide script below is a real external
+         subresource whose SRI hash this rule is the reason for.
+         nosemgrep: html.security.audit.missing-integrity.missing-integrity -->
+    <link rel="canonical" href="https://chelseakr.github.io/tods-validate/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="tods-validate" />
+    <meta property="og:url" content="https://chelseakr.github.io/tods-validate/" />
+    <meta
+      property="og:title"
+      content="tods-validate playground: check a TODS feed in your browser"
+    />
+    <meta
+      property="og:description"
+      content="Validate a Transit Operational Data Standard (TODS) feed in your browser. Nothing is uploaded: the validator runs on your machine via Pyodide, so it is safe for non-public operational data."
+    />
+    <!-- The share card is 1200x630, the box every network crops an unfurled
+         link to, and summary_large_image is what asks X for that box instead
+         of a square thumbnail. Absolute for the same reason the canonical is:
+         a crawler resolves og:image against nothing, so a relative one is
+         fetched from the shared origin's 404. pages.yml uploads web/ whole,
+         so the file is served at exactly this address. -->
+    <meta property="og:image" content="https://chelseakr.github.io/tods-validate/og-card.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="tods-validate: validate TODS feeds everywhere. CLI, CI, browser, editor, pre-commit, Docker, and LSP."
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://chelseakr.github.io/tods-validate/og-card.png" />
+    <meta
+      name="twitter:image:alt"
+      content="tods-validate: validate TODS feeds everywhere. CLI, CI, browser, editor, pre-commit, Docker, and LSP."
+    />
     <style>
       :root {
         color-scheme: light dark;
@@ -99,6 +164,11 @@
 
     <footer>
       <p id="footer-version"></p>
+      <p>
+        <a href="https://ko-fi.com/T6T6GMYTU" target="_blank" rel="noopener noreferrer"
+          >Support this work on Ko-fi</a
+        >
+      </p>
     </footer>
 
     <!-- Pyodide runtime. Update the version to the current Pyodide release,
@@ -113,7 +183,7 @@
     <script>
       // Keep in sync with the pinned wheel version below and the Pyodide
       // <script> tag's src/integrity above when bumping either.
-      const TODS_VALIDATE_VERSION = "0.8.0";
+      const TODS_VALIDATE_VERSION = "0.11.0";
       const PYODIDE_VERSION = "v0.26.4";
 
       const status = document.getElementById("status");

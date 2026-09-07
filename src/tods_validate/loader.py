@@ -45,6 +45,35 @@ class Row:
     extra_cells: tuple[str, ...] = ()
 
 
+# Problem codes that stop parsing outright, so the file has no headers and no
+# rows (see the early `return feed` for each in _parse_csv). "ragged" and
+# "duplicate_header" are per-row/per-column defects on an otherwise-parsed
+# file, so they leave FeedFile.readable True. This is the single source of
+# truth for that split: TODS-E103 reports the file, and anything that reads
+# another file's rows to resolve a reference (gtfs_companion.build_companion,
+# TODS-E301/E303/W302) must treat a False here as absent, not present-but-
+# empty -- see #125.
+BLOCKING_PROBLEM_CODES = frozenset({"encoding", "empty", "csv_error"})
+
+# Codes that leave the file parsed but not fully read: the header and rows are
+# there, but some values did not survive the read. "ragged" means a row's
+# values do not line up with the header, so any field of that row may hold a
+# neighbouring column's value or nothing at all; "duplicate_header" means a
+# column was declared twice and the second column's values were dropped. On a
+# TODS file these are findings in their own right (TODS-E104, TODS-E105).
+# On a file whose rows another check reads to resolve a reference, they are
+# something else: the reader's view of that file is incomplete, and an ID it
+# did not read is indistinguishable from an ID the feed does not contain. See
+# ADR 0007 and FeedFile.fully_read.
+DEGRADING_PROBLEM_CODES = frozenset({"ragged", "duplicate_header"})
+
+# Every code _parse_csv can record is in exactly one of the two sets above.
+# tests/test_loader.py asserts that against the codes the parser actually
+# emits, so a code added later cannot quietly default to "harmless": it has to
+# be classified, and until it is, the assertion fails.
+PROBLEM_CODES = BLOCKING_PROBLEM_CODES | DEGRADING_PROBLEM_CODES
+
+
 @dataclass
 class LoadProblem:
     """A structural defect found while reading a file."""
@@ -70,6 +99,24 @@ class FeedFile:
 
     def column(self, name: str) -> bool:
         return name in self.headers
+
+    @property
+    def readable(self) -> bool:
+        """False if the file could not be parsed at all: see BLOCKING_PROBLEM_CODES."""
+        return not any(p.code in BLOCKING_PROBLEM_CODES for p in self.problems)
+
+    @property
+    def fully_read(self) -> bool:
+        """False if any value in this file did not survive the read.
+
+        Strictly weaker than :attr:`readable`: a file can parse and still have
+        lost values, which is the case ``readable`` alone cannot express. The
+        test is "were any problems recorded", not "were any *known* degrading
+        problems recorded", so a problem code introduced later counts as
+        incomplete until someone decides otherwise, rather than the other way
+        round.
+        """
+        return not self.problems
 
 
 @dataclass
@@ -117,8 +164,11 @@ def _parse_csv(name: str, data: bytes, encoding: str | None = None) -> FeedFile:
             LoadProblem(
                 code="encoding",
                 message=(
-                    f"{name} is not valid {codec} (byte {exc.start}). TODS files must be "
-                    f"UTF-8 encoded, like GTFS.{hint}"
+                    # _parse_csv reads both the TODS package and (via
+                    # gtfs_companion) a companion GTFS feed, so this must not
+                    # claim either format by name -- see #125.
+                    f"{name} is not valid {codec} (byte {exc.start}). Transit data files "
+                    f"must be UTF-8 encoded.{hint}"
                 ),
             )
         )
@@ -165,6 +215,23 @@ def _parse_csv(name: str, data: bytes, encoding: str | None = None) -> FeedFile:
         seen.add(h)
 
     width = len(header)
+    # One shared instance per distinct cell value in this file. Transit data is
+    # overwhelmingly repetitive in the columns that matter -- service_id,
+    # route_id, event_type, dates, times -- so most cells are a value the file
+    # has already used, and holding one string instead of thousands of equal
+    # ones is where the memory goes. Measured on the 10,000-trip synthetic
+    # benchmark: peak traced memory falls from 36.6x the input bytes to 30.5x,
+    # with throughput unchanged (65.9k vs 65.0k rows/CPU-s, inside the noise).
+    #
+    # The trade is real and bounded: on a file whose every cell is distinct the
+    # pool shares nothing and costs its own entries, measured at 6% more peak
+    # (10.9x to 11.5x). That is the shape of data this tool does not validate.
+    #
+    # A per-file dict, not sys.intern: interned strings live until the
+    # interpreter exits, which in the long-running LSP server would turn every
+    # feed a user opens into a permanent leak. This pool is dropped when the
+    # file is parsed, and only the values the rows actually hold survive.
+    pool: dict[str, str] = {}
     for i, raw in enumerate(raw_rows[1:], start=2):
         # Skip genuinely empty lines (a bare newline). An all-blank ",,," data
         # row is kept so TODS-E201 reports its missing required values instead
@@ -192,7 +259,8 @@ def _parse_csv(name: str, data: bytes, encoding: str | None = None) -> FeedFile:
         for j, h in enumerate(header):
             if h in values:
                 continue
-            values[h] = raw[j] if j < len(raw) else ""
+            cell = raw[j] if j < len(raw) else ""
+            values[h] = pool.setdefault(cell, cell)
         extra = tuple(raw[width:])
         feed.rows.append(Row(line=i, values=values, extra_cells=extra))
 

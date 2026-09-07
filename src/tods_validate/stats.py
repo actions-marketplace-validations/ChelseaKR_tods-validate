@@ -47,7 +47,12 @@ class FeedStats:
     error: str | None = None
 
 
-def _event_minutes(start: str, end: str) -> int:
+def event_minutes(start: str, end: str) -> int:
+    """Whole minutes between two GTFS times, or 0 when either will not parse.
+
+    Public because ``pickdiff`` reports the same revenue/non-revenue split
+    between two packages and must use this rule rather than a second one.
+    """
     s, e = parse_time(start), parse_time(end)
     if s is None or e is None or e < s:
         return 0
@@ -69,7 +74,7 @@ def collect_stats(  # noqa: C901 -- pragmatic complexity; ratchet tracked in doc
         for row in run_events.rows:
             runs.add((row.values.get("service_id", ""), row.values.get("run_id", "")))
             trip_id = row.values.get("trip_id", "")
-            minutes = _event_minutes(
+            minutes = event_minutes(
                 row.values.get("start_time", ""), row.values.get("end_time", "")
             )
             if trip_id:
@@ -103,12 +108,19 @@ def collect_stats(  # noqa: C901 -- pragmatic complexity; ratchet tracked in doc
     stats.distinct_blocks = len(event_blocks | assigned_blocks)
 
     companion = None
-    from .schema import GTFS_FILENAMES
+    # The narrow set, matching runner.py: only the six files TODS IDs actually
+    # resolve against can make a package its own companion feed. A stray
+    # `agency.txt` (or a `trips_supplement.txt` with no `trips.txt` to modify)
+    # says nothing about whether a `trip_id` exists, so treating it as a
+    # companion produced GTFS rows -- 0 trips, or trip counts read off the
+    # supplement -- for a package `validate` correctly reports as having no
+    # companion feed at all.
+    from .schema import GTFS_COMPANION_FILENAMES
 
     if gtfs_path is not None:
         gtfs_pkg = load_package(gtfs_path, encoding=encoding)
         companion = build_companion(gtfs_pkg, package, str(gtfs_path))
-    elif any(name in GTFS_FILENAMES for name in package.files):
+    elif any(name in GTFS_COMPANION_FILENAMES for name in package.files):
         companion = build_companion(package, package, package.source)
 
     if companion is not None:
@@ -158,6 +170,16 @@ _ROW_SPECS: tuple[tuple[str, str], ...] = (
     ("Distinct blocks", "distinct_blocks"),
 )
 
+# Rendered in place of a metric that has no value. `trip_coverage_pct` is None
+# whenever the companion feed has no trips at all, and "None%" is not a
+# percentage -- it is the absence of one, printed as though it were a reading.
+NOT_APPLICABLE = "—"
+
+
+def _coverage_cell(pct: float | None) -> str:
+    return f"{pct}%" if pct is not None else NOT_APPLICABLE
+
+
 _GTFS_ROW_SPECS: tuple[tuple[str, str], ...] = (
     ("GTFS trips", "gtfs_trips"),
     ("Trips with a run event", "trips_with_run_event"),
@@ -179,9 +201,14 @@ def _stat_rows(stats: FeedStats) -> list[tuple[str, object]]:
     if stats.gtfs_trips is not None:
         rows.append(("GTFS trips", stats.gtfs_trips))
         rows.append(("Trips with a run event", stats.trips_with_run_event))
-        rows.append(("Trip coverage", f"{stats.trip_coverage_pct}%"))
+        rows.append(("Trip coverage", _coverage_cell(stats.trip_coverage_pct)))
         rows.append(("GTFS blocks", stats.gtfs_blocks))
         rows.append(("Blocks with a vehicle", stats.blocks_with_vehicle))
+    elif stats.error is None:
+        # Say it rather than leaving the block out silently: a reader cannot
+        # tell an omitted section from a section that reported nothing, and
+        # `validate` on the same directory states the same fact explicitly.
+        rows.append(("GTFS coverage", "not measured, no companion GTFS feed was provided"))
     return rows
 
 
@@ -317,10 +344,7 @@ def _comparison_rows(feeds: list[FeedStats]) -> list[tuple[str, list[object]]]:
         rows.append(
             (
                 "Trip coverage",
-                [
-                    f"{f.trip_coverage_pct}%" if f.trip_coverage_pct is not None else "—"
-                    for f in feeds
-                ],
+                [_coverage_cell(f.trip_coverage_pct) for f in feeds],
             )
         )
         rows.append(

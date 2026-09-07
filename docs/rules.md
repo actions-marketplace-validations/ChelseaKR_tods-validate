@@ -205,6 +205,29 @@ Not an error: the column is carried into the merged GTFS as an extension field. 
 
 Spec reference: <https://tods-transit.org/spec/#supplement-files>
 
+### TODS-W109: File belongs to a different TODS spec version
+
+Severity: WARNING.
+
+A file in the package is defined by a TODS spec version other than the one being validated against, so it was not validated. A v1.0.0 file in a package validated at the 2.1.0 default looks like an unknown file otherwise.
+
+Example (`(package root)`):
+
+Before:
+```csv
+run_events.txt
+deadheads.txt
+```
+
+After:
+```csv
+(re-run with --spec-version 1.0.0, or drop deadheads.txt)
+```
+
+Not a misspelled file: deadheads.txt is a real TODS file, defined by v1.0.0 and not by the 2.1.0 spec this package was validated against.
+
+Spec reference: <https://tods-transit.org/spec/#files>
+
 ## Field values (TODS-x2xx)
 
 ### TODS-E201: Required value is missing
@@ -353,6 +376,30 @@ Leading/trailing spaces are kept as part of the value by most parsers and silent
 
 Spec reference: <https://tods-transit.org/spec/>
 
+### TODS-E207: Value is not a valid color
+
+Severity: ERROR.
+
+A GTFS Color field is not six hexadecimal digits (0-9, A-F), with no leading '#'. routes_supplement.txt's route_color and route_text_color inherit their type from GTFS routes.txt; a value here becomes the effective color in the TODS-Supplemented GTFS the same way a bad value in routes.txt itself would be invalid, even though this file is not GTFS and this validator does not otherwise re-check the base feed.
+
+Example (`routes_supplement.txt`):
+
+Before:
+```csv
+route_id,route_color
+R1,red
+```
+
+After:
+```csv
+route_id,route_color
+R1,FF0000
+```
+
+GTFS Color fields are six hex digits with no leading '#'; a named color like 'red' is not valid.
+
+Spec reference: <https://tods-transit.org/spec/#supplement-files>
+
 ## References between files (TODS-x3xx)
 
 ### TODS-E301: Employee assignment points to a run that does not exist
@@ -379,11 +426,11 @@ run_id 2 has no run_events.txt rows under service_id daily; point at a run that 
 
 Spec reference: <https://tods-transit.org/spec/#employee_run_datestxt>
 
-### TODS-W302: Referenced file is missing, references not checked
+### TODS-W302: Referenced file is missing or was not read in full, references not checked
 
 Severity: WARNING.
 
-A file references another file that is not in the package (or, for GTFS targets, not in the companion feed), so those references could not be validated.
+A file references another file that is not in the package (or, for GTFS targets, not in the companion feed), that could not be read at all (TODS-E103), or that parsed but did not read in full because a row was ragged or a column was declared twice. In each case those references could not be validated, and are reported as unchecked rather than clean.
 
 Example (`employee_run_dates.txt`):
 
@@ -1056,5 +1103,33 @@ daily,1,30,Operator,s1,10:30:00,s1,14:00:00
 ```
 
 Nearly 8 hours pass with no Break event. Advisory check; opt in with --enable advisory or --enable TODS-I601.
+
+Spec reference: <https://tods-transit.org/spec/#run_eventstxt>
+
+### TODS-I602: One value is spelled more than one way
+
+Severity: INFO. Opt-in: off by default, enable with `--enable advisory` or `--enable TODS-I602`.
+
+run_events.txt writes the same event_type or job_type two or more ways, differing only in capitalization or in the separator between words. The spec lets a producer use any values but asks for them to be consistent, and a consumer that matches on the literal value reads the spellings as unrelated types. Advisory only: two spellings can be two genuinely different values.
+
+Interpretation: advisory: two values count as one value spelled differently when they match after case-folding and removing spaces, hyphens, and underscores
+
+Example (`run_events.txt`):
+
+Before:
+```csv
+service_id,run_id,event_sequence,event_type,start_location,start_time,end_location,end_time
+daily,1,10,Sign-In,s1,06:00:00,s1,06:05:00
+daily,1,20,sign in,s1,06:05:00,s1,06:10:00
+```
+
+After:
+```csv
+service_id,run_id,event_sequence,event_type,start_location,start_time,end_location,end_time
+daily,1,10,Sign-In,s1,06:00:00,s1,06:05:00
+daily,1,20,Sign-In,s1,06:05:00,s1,06:10:00
+```
+
+'Sign-In' and 'sign in' are one event type written two ways, and a consumer matching the literal value sees two. Advisory check; opt in with --enable advisory or --enable TODS-I602.
 
 Spec reference: <https://tods-transit.org/spec/#run_eventstxt>

@@ -13,12 +13,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tods-validate"
-version = "0.8.0"
+version = "0.11.0"
 description = "Validator for Transit Operational Data Standard (TODS) feeds, formerly the Operational Data Standard (ODS)"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{ name = "Chelsea Kelly-Reif" }]
 keywords = ["transit", "gtfs", "tods", "ods", "validation", "cal-itp"]
 classifiers = [
@@ -26,7 +26,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Other Audience",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: GIS",
@@ -42,10 +41,15 @@ tods-validate = "tods_validate.cli:main"
 tods-validate-lsp = "tods_validate.lsp:main"
 
 [project.optional-dependencies]
+# Runtime extras only: things an *installed* tods-validate can be asked to do.
+# Development tooling lives in [dependency-groups] below (PEP 735, CQ-27), so
+# a linter or a type checker can never reach an end user as an extra.
 lsp = ["pygls>=2"]
 # tods_validate.read.to_dataframe(); the rest of the read namespace has no
 # dependency on pandas.
 dataframe = ["pandas>=2"]
+
+[dependency-groups]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
@@ -56,6 +60,10 @@ dev = [
     "pygls>=2",
     "pip-audit>=2.7",
     "hypothesis>=6.100",
+    # tests/test_branch_ruleset.py reads .github/workflows/*.yml. It arrives
+    # transitively via pre-commit either way; declared so the test does not
+    # depend on somebody else's dependency tree.
+    "pyyaml>=6",
 ]
 # Advisory mutation testing (not part of the gate). Kept out of `dev` so the CI
 # gate install stays lean; installed only where mutation runs. See
@@ -64,7 +72,7 @@ mutation = ["mutmut>=3.6"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -94,7 +102,18 @@ max-complexity = 10
 
 [tool.mypy]
 strict = true
-files = ["src"]
+# `scripts/` is in scope because those files *are* the gates: `make docs-check`,
+# `make contract-check`, `make npm-audit`, `make i18n-check` and the weekly spec
+# tripwire are all scripts/*.py. Until now `ruff check src tests scripts` covered
+# them and `mypy` did not, so the merge-blocking checks were the least verified
+# code in the repository. Bringing them in cost one annotation
+# (scripts/spec_watch.py) once `src/tods_validate/py.typed` existed; before that
+# marker every `from tods_validate import ...` in a script was an import mypy
+# reported as untyped and then refused to follow, which is also why adding the
+# marker and adding this path belong together.
+#
+# `tests/` stays out of scope; see docs/CONFORMANCE-GAPS.md.
+files = ["src", "scripts"]
 
 [[tool.mypy.overrides]]
 # pandas is an optional extra (tods_validate.read.to_dataframe); its stubs are

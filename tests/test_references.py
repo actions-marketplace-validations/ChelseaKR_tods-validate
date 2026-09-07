@@ -6,6 +6,7 @@ import pytest
 
 from conftest import FIXTURES, rule_ids, run_invalid_fixture
 from tods_validate.findings import Finding, Severity
+from tods_validate.loader import Package
 from tods_validate.runner import run
 
 RULES = (
@@ -163,6 +164,58 @@ def test_time_check_skips_mid_trip_events(tmp_path: Path) -> None:
     assert not any(f.rule_id == "TODS-W316" for f in findings)
 
 
+def test_unreadable_vehicles_file_does_not_invent_e303(tmp_path: Path) -> None:
+    # #125: an undecodable vehicles.txt used to count as present-but-empty,
+    # so every real vehicle_id in vehicle_assignments.txt read as undefined.
+    (tmp_path / "vehicles.txt").write_bytes(b"\xff\xfe\x00\x01garbage-not-utf8")
+    (tmp_path / "vehicle_assignments.txt").write_text(
+        "block_id,vehicle_id,service_id\nB1,bus-1,weekday\n"
+    )
+    _, findings = run(tmp_path)
+    assert "TODS-E303" not in rule_ids(findings)
+    assert "TODS-E103" in rule_ids(findings)  # the file itself is reported unreadable
+    w302 = [f for f in findings if f.rule_id == "TODS-W302"]
+    assert w302, "expected TODS-W302 to disclose that vehicles.txt could not be read"
+    assert "vehicles.txt could not be read" in w302[0].message
+    assert "TODS-E103" in w302[0].message
+
+
+def test_unreadable_run_events_file_does_not_invent_e301(tmp_path: Path) -> None:
+    # Same shape as above, on employee_run_dates.txt -> run_events.txt.
+    (tmp_path / "run_events.txt").write_bytes(b"\xff\xfe\x00\x01garbage-not-utf8")
+    (tmp_path / "employee_run_dates.txt").write_text(
+        "employee_id,service_id,run_id,date\nE1,weekday,1,20260105\n"
+    )
+    _, findings = run(tmp_path)
+    assert "TODS-E301" not in rule_ids(findings)
+    assert "TODS-E103" in rule_ids(findings)
+    w302 = [f for f in findings if f.rule_id == "TODS-W302"]
+    assert w302, "expected TODS-W302 to disclose that run_events.txt could not be read"
+    assert "run_events.txt could not be read" in w302[0].message
+
+
+def test_unreadable_companion_trips_does_not_invent_e307(tmp_path: Path) -> None:
+    # #125's headline repro: an undecodable companion trips.txt used to count
+    # as present, so run_events.txt's trip_id references resolved against an
+    # empty table and every one read as a dangling TODS-E307.
+    (tmp_path / "trips.txt").write_bytes(b"\xff\xfe\x00\x01garbage-not-utf8")
+    (tmp_path / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nweekday,1,1,1,1,1,0,0,20260101,20261231\n"
+    )
+    (tmp_path / "stops.txt").write_text("stop_id\nS1\n")
+    (tmp_path / "run_events.txt").write_text(
+        "service_id,run_id,event_sequence,event_type,trip_id,start_location,start_time,"
+        "end_location,end_time\nweekday,1,10,operator,T1,S1,09:00:00,S1,10:00:00\n"
+    )
+    _, findings = run(tmp_path)
+    assert "TODS-E307" not in rule_ids(findings)
+    w302 = [f for f in findings if f.rule_id == "TODS-W302" and "trips.txt" in f.message]
+    assert w302, "expected TODS-W302 to disclose that the companion trips.txt could not be read"
+    assert "could not be read" in w302[0].message
+    assert "has no trips.txt" not in w302[0].message  # distinct from the missing-file wording
+
+
 def test_time_check_treats_2400_as_midnight(tmp_path: Path) -> None:
     # The event ends at 24:00:00 and the trip arrives at 24:00:00: equal, no W316.
     (tmp_path / "trips.txt").write_text("trip_id,route_id,service_id\nT1,R1,weekday\n")
@@ -178,3 +231,138 @@ def test_time_check_treats_2400_as_midnight(tmp_path: Path) -> None:
     )
     _, findings = run(tmp_path)
     assert not any(f.rule_id == "TODS-W316" for f in findings)
+
+
+def test_ragged_companion_trips_does_not_invent_e307(tmp_path: Path) -> None:
+    # The companion-GTFS half of #125's defect class. trips.txt parses, so it
+    # counted as present; the ragged row dropped trip T1's trip_id; and the
+    # run event that names T1 was reported as TODS-E307 -- an ERROR against
+    # the producer's TODS file for a defect in their GTFS file, with a message
+    # asserting T1 "does not exist in the companion GTFS trips.txt" when it
+    # does. Nothing anywhere reported the ragged row itself.
+    (tmp_path / "trips.txt").write_text(
+        "route_id,service_id,trip_id,block_id\nR1,weekday,T1,B1\nR1,weekday\n"
+    )
+    (tmp_path / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nweekday,1,1,1,1,1,0,0,20260101,20261231\n"
+    )
+    (tmp_path / "stops.txt").write_text("stop_id\nS1\n")
+    (tmp_path / "run_events.txt").write_text(
+        "service_id,run_id,event_sequence,event_type,trip_id,start_location,start_time,"
+        "end_location,end_time\nweekday,1,10,operator,T1,S1,09:00:00,S1,10:00:00\n"
+    )
+    _, findings = run(tmp_path)
+    assert "TODS-E307" not in rule_ids(findings)
+    w302 = [f for f in findings if f.rule_id == "TODS-W302" and "trips.txt" in f.message]
+    assert w302, "expected TODS-W302 to disclose that the companion trips.txt was not read in full"
+    assert "could not be read in full" in w302[0].message
+    # Distinct from both of the other two wordings, so a reader can tell which
+    # of the three remedies applies.
+    assert "has no trips.txt" not in w302[0].message
+    assert "trips.txt could not be read (" not in w302[0].message
+
+
+def test_a_complete_companion_trips_still_reports_a_real_e307(tmp_path: Path) -> None:
+    # Positive control for the test above: same feed, same run event, but a
+    # trips.txt that reads in full and genuinely does not contain T1. TODS-E307
+    # must still fire, or the test above could be green because E307 stopped
+    # working rather than because it stopped being invented.
+    (tmp_path / "trips.txt").write_text("route_id,service_id,trip_id,block_id\nR1,weekday,T2,B1\n")
+    (tmp_path / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nweekday,1,1,1,1,1,0,0,20260101,20261231\n"
+    )
+    (tmp_path / "stops.txt").write_text("stop_id\nS1\n")
+    (tmp_path / "run_events.txt").write_text(
+        "service_id,run_id,event_sequence,event_type,trip_id,start_location,start_time,"
+        "end_location,end_time\nweekday,1,10,operator,T1,S1,09:00:00,S1,10:00:00\n"
+    )
+    _, findings = run(tmp_path)
+    assert "TODS-E307" in rule_ids(findings)
+
+
+def _gap_message(unreadable: dict[str, str], degraded: dict[str, str], target: str) -> str:
+    """TODS-W302's companion-feed sentence, called directly.
+
+    Going through `run()` exercises this helper only along whichever branch the
+    fixture happens to take, and only for a single-file target. Mutation
+    testing showed the cost: 16 mutants inside it survived the whole suite,
+    including ones that replaced the " or " separator, the "; " reason joiner,
+    and the " and " file joiner with other strings. Those separators are the
+    difference between a warning a producer can act on and a mangled sentence.
+    """
+    from tods_validate.gtfs_companion import CompanionGTFS
+    from tods_validate.rules import ValidationContext
+    from tods_validate.rules.references import _companion_gap_message
+
+    context = ValidationContext(
+        package=Package(source="test"),
+        gtfs=CompanionGTFS(source="test", unreadable=dict(unreadable), degraded=dict(degraded)),
+    )
+    return _companion_gap_message(context, "run_events.txt", target)
+
+
+def test_companion_gap_message_reports_a_missing_file() -> None:
+    assert _gap_message({}, {}, "trips.txt") == (
+        "The companion GTFS feed has no trips.txt, so run_events.txt "
+        "references into it could not be checked."
+    )
+    # An alternatives target is quoted whole, not split and half-reported.
+    assert _gap_message({}, {}, "calendar.txt or calendar_dates.txt") == (
+        "The companion GTFS feed has no calendar.txt or calendar_dates.txt, so "
+        "run_events.txt references into it could not be checked."
+    )
+
+
+def test_companion_gap_message_reports_an_unreadable_file() -> None:
+    assert _gap_message({"trips.txt": "trips.txt is empty."}, {}, "trips.txt") == (
+        "The companion GTFS feed's trips.txt could not be read (trips.txt is empty.), "
+        "so run_events.txt references into it could not be checked."
+    )
+
+
+def test_companion_gap_message_names_every_unreadable_alternative() -> None:
+    # Both halves of an alternatives group can fail at once. The message has to
+    # name both files and both reasons, joined by " and " and "; " respectively.
+    message = _gap_message(
+        {"calendar.txt": "calendar.txt is empty.", "calendar_dates.txt": "bad encoding."},
+        {},
+        "calendar.txt or calendar_dates.txt",
+    )
+    assert message == (
+        "The companion GTFS feed's calendar.txt and calendar_dates.txt could not be "
+        "read (calendar.txt is empty.; bad encoding.), so run_events.txt references "
+        "into it could not be checked."
+    )
+
+
+def test_companion_gap_message_reports_a_short_read() -> None:
+    assert _gap_message({}, {"trips.txt": "trips.txt row 4 is ragged."}, "trips.txt") == (
+        "The companion GTFS feed's trips.txt could not be read in full (trips.txt row 4 "
+        "is ragged.), so run_events.txt references into it could not be checked: an ID "
+        "the reader could not place would read as an ID the feed does not have."
+    )
+
+
+def test_companion_gap_message_prefers_unreadable_over_short_read() -> None:
+    # A file that could not be parsed at all and a sibling that was short-read
+    # are different remedies. Unreadable is the more serious of the two and is
+    # what the sentence leads with; without this the branch order is unpinned.
+    message = _gap_message(
+        {"calendar.txt": "calendar.txt is empty."},
+        {"calendar_dates.txt": "calendar_dates.txt row 2 is ragged."},
+        "calendar.txt or calendar_dates.txt",
+    )
+    assert "calendar.txt could not be read (" in message
+    assert "in full" not in message
+
+
+def test_companion_gap_message_only_names_files_in_the_target() -> None:
+    # Positive control for the branch selection: an unreadable file that is not
+    # one of this target's alternatives must not pull the message off the
+    # missing-file branch.
+    assert _gap_message({"stops.txt": "stops.txt is empty."}, {}, "trips.txt") == (
+        "The companion GTFS feed has no trips.txt, so run_events.txt "
+        "references into it could not be checked."
+    )

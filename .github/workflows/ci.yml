@@ -7,8 +7,17 @@ on:
 
 # Cancel superseded runs of the same ref (CICD §11c): a new push to a PR
 # obsoletes the in-flight run, so spending the remaining minutes is waste.
+#
+# The trailing discriminator is what stops that from eating a verdict on main.
+# Keyed on `github.ref` alone every push to main shares a single group, so a
+# second push cancels the first commit's run and that commit lands on main
+# with no verdict at all. The run reports `cancelled`, which is not a failure,
+# so nothing goes red and nobody is told a commit went unchecked. On a
+# pull_request the ref is already the PR's own merge ref, so `pr` keeps the
+# coalescing this block exists for; on a push the group carries the commit
+# SHA, so two commits can never displace each other's run.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -17,14 +26,25 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          enable-cache: true
           python-version: "3.12"
-      - run: uv sync --frozen --extra dev
+      # CQ-09 drift half of the gate; see the note in the Makefile's `lockfile`
+      # target for why `uv sync --frozen` alone cannot fail on a stale lock.
+      - run: uv lock --check
+      # The other lockfile: the hash-pinned runtime set action.yml installs.
+      # It is generated from uv.lock and had drifted two minor versions of
+      # click behind it, unnoticed, because nothing compared them. Runs here
+      # rather than in a job of its own because this is the job that already
+      # has uv, and the check needs no index.
+      - run: make action-lock
+      - run: uv sync --frozen --group dev
       - run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - run: make lint
       - run: make format
@@ -32,26 +52,70 @@ jobs:
 
   docs-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
+          cache: 'pip'
           python-version: "3.12"
       - run: python -m pip install .
       - name: Check that docs/rules.md matches the rule registry
         run: make docs-check
 
-  i18n:
-    # Enforce the i18n N/A declaration (INTERNATIONALIZATION-STANDARD §1): fail
-    # if docs/I18N.md is missing its status marker or its Reason line.
+  # Compares docs/v1-contract-candidate.json against the implementation on every
+  # pull request. It is a `make verify` gate, but until now it reached CI only
+  # through the release workflows, which are `on: release` -- so the public
+  # contract was first verified after a release tag was cut, and a change to a
+  # rule's declared category (which docs-check and the conformance corpus are
+  # both blind to) could land on main with fully green CI.
+  contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          cache: 'pip'
+          python-version: "3.12"
+      - run: python -m pip install .
+      - name: Check the public contract matches the implementation
+        run: make contract-check
+
+  # The two stewardship contracts that are AUTO-GATE in their standards, which
+  # the portfolio defines as merge-blocking in CI rather than advisory: the
+  # incident-response label/postmortem/wildcard-staging contract (IR-05/07/15/
+  # 16/17) and the data-card presence check (DG-01). Both also run in `make
+  # verify`; this is the half that blocks a merge.
+  stewardship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Incident-response contract (IR-05/07/15/16/17)
+        run: make incident-check
+      - name: Data cards match the declared source list (DG-01)
+        run: make data-cards-check
+
+  i18n:
+    # Enforce the i18n N/A declaration (INTERNATIONALIZATION-STANDARD §1): fail
+    # if docs/I18N.md is missing its status marker or its Reason line.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
       - name: Check the i18n N/A declaration is present
@@ -60,31 +124,79 @@ jobs:
   # Validates CITATION.cff against the CFF 1.2.0 schema (DOC-08). Catches
   # malformed citation metadata (the release checklist only eyeballs that
   # version/date-released match the tag; this checks the file parses at all).
-  citation:
+  # This is the software's own citation metadata, not the spec citations that
+  # findings carry.
+  citation-cff:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-      - run: make citation
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+      - run: make citation-cff
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --frozen --extra dev
+      # CQ-09 drift half of the gate; see the note in the Makefile's `lockfile`
+      # target for why `uv sync --frozen` alone cannot fail on a stale lock.
+      - run: uv lock --check
+      - run: uv sync --frozen --group dev
       - run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - run: make test
 
+  # Perf budget (QM-02): validation throughput must stay within
+  # perf/baseline.json's regression factor. scripts/benchmark.py could always
+  # measure this; nothing compared the measurement to anything, so a regression
+  # was only visible to whoever ran it and remembered the old number.
+  #
+  # The baseline is recorded from this job, on this machine class, because a
+  # number measured anywhere else is not comparable to what this job measures.
+  # The check fails rather than passes while the baseline is unrecorded.
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      # CQ-09 drift half of the gate; see the note in the Makefile's `lockfile`
+      # target for why `uv sync --frozen` alone cannot fail on a stale lock.
+      - run: uv lock --check
+      - run: uv sync --frozen
+      - run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - run: make perf-check
+      # Peak memory per input byte, the other axis of the same budget (FIX-04).
+      # Runs after perf-check rather than instead of it: a change can trade one
+      # for the other, and a budget that only watches one axis rewards exactly
+      # that trade.
+      - run: make memory-check
+
+  # WCAG 2.1 AA automation, and nothing else. `make a11y` used to begin with
+  # `npm audit --audit-level=high`, so an unfixable advisory in the npm
+  # toolchain aborted the recipe before pa11y-ci started: this job went red for
+  # a dependency reason and performed no accessibility check at all. The Node
+  # dependency audit now runs as its own gate in the `audit` job below, which
+  # is a required status check; this job answers one question and reports one
+  # result.
   accessibility:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -92,9 +204,13 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          enable-cache: true
           python-version: "3.12"
+      # CQ-09 drift half of the gate; see the note in the Makefile's `lockfile`
+      # target for why `uv sync --frozen` alone cannot fail on a stale lock.
+      - run: uv lock --check
       - run: uv sync --frozen
       - run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -110,25 +226,48 @@ jobs:
           echo "PUPPETEER_EXECUTABLE_PATH=$a11y_chrome" >> "$GITHUB_ENV"
       - run: make a11y
 
-  # Dependency vulnerability audit (CQ-11 / SEC-11). Blocking; no mute pattern.
+  # Dependency vulnerability audit (CQ-11 / SEC-11), Python and Node. Blocking;
+  # no mute pattern. Both audits run on every commit even when the other one
+  # fails: `if: ${{ !cancelled() }}` lets the later step start regardless of the
+  # earlier step's result, and a failed step still fails this job, so neither
+  # audit can hide behind the other's result.
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          enable-cache: true
           python-version: "3.12"
-      - run: uv sync --frozen --extra dev
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      # CQ-09 drift half of the gate; see the note in the Makefile's `lockfile`
+      # target for why `uv sync --frozen` alone cannot fail on a stale lock.
+      - run: uv lock --check
+      - run: uv sync --frozen --group dev
       - run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
-      - run: make audit
+      - name: Python dependency audit (pip-audit over uv.lock)
+        run: make audit
+      # npm audit reads the committed lockfile, so no npm ci is needed here.
+      - name: Node dependency audit (npm audit, adjudicated against waivers.yml)
+        if: ${{ !cancelled() }}
+        run: make npm-audit
 
-  # Secret scan over the PR/push diff and full history (SEC-17/18). Installs
-  # the gitleaks CLI directly (checksum-verified) rather than the third-party
+  # Secret scan over the full history and, separately, the checked-out tree
+  # (SEC-17/18). `make secrets` runs both: a commit scan cannot see a file that
+  # was never committed, and the tree scan cannot see a secret that was
+  # committed and later deleted. See the Makefile recipe. Installs the gitleaks
+  # CLI directly (checksum-verified) rather than the third-party
   # `gitleaks/gitleaks-action`, which is license-gated for organizations.
   secrets:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       GITLEAKS_VERSION: "8.30.1"
       GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
@@ -149,6 +288,7 @@ jobs:
 
   action-self-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:

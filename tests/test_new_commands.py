@@ -87,6 +87,38 @@ def test_diff_reports_introduced_and_exit_code() -> None:
     assert result.exit_code == 1
 
 
+def test_diff_does_not_report_a_dropped_companion_as_a_fix(tmp_path: Path) -> None:
+    # #126's repro shape: a companion GTFS trip_id reference (TODS-E307) in
+    # OLD, with trips.txt dropped in NEW (calendar.txt/stops.txt held
+    # constant so TODS-W302 doesn't also fire in OLD and confound the
+    # count). Nothing was fixed, TODS-E307 simply stopped running, but it
+    # used to be reported "fixed" with exit code 0.
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    calendar = (
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nweekday,1,1,1,1,1,0,0,20260101,20261231\n"
+    )
+    run_events = (
+        "service_id,run_id,event_sequence,event_type,trip_id,start_location,start_time,"
+        "end_location,end_time\nweekday,1,10,operator,ghost-trip,S1,09:00:00,S1,10:00:00\n"
+    )
+    for d in (old_dir, new_dir):
+        (d / "calendar.txt").write_text(calendar)
+        (d / "stops.txt").write_text("stop_id\nS1\n")
+        (d / "run_events.txt").write_text(run_events)
+    (old_dir / "trips.txt").write_text("trip_id,route_id,service_id\nT1,R1,weekday\n")
+    # new_dir intentionally has no trips.txt.
+
+    result = invoke("diff", str(old_dir), str(new_dir))
+    assert "fixed: 0" in result.output
+    assert "unknown: 1" in result.output
+    assert "? TODS-E307" in result.output
+    assert "rule(s) that ran in OLD do not run in NEW" in result.output
+    assert "TODS-E307" in result.output.split("do not run in NEW")[1]
+
+
 def test_batch_rolls_up_and_fails_on_any_error() -> None:
     result = invoke("batch", E201, str(FIXTURES / "invalid" / "TODS-W101"))
     assert result.exit_code == 1
@@ -99,13 +131,65 @@ def test_batch_json() -> None:
     assert payload["feeds"][0]["errors"] >= 1
 
 
+def test_batch_json_carries_coverage_per_feed() -> None:
+    # #127: batch used the two-tuple run() wrapper, so its JSON carried no
+    # coverage manifest at all -- a TODS-only feed's `status: pass` and
+    # `0 error(s)` could not be told apart from a fully-checked feed.
+    result = invoke("batch", "--format", "json", str(FIXTURES / "invalid" / "TODS-W101"))
+    feed = json.loads(result.output)["feeds"][0]
+    assert feed["status"] == "pass"
+    assert feed["checksNotRun"] > 0  # the GTFS reference rules could not run
+    assert feed["coverage"]["skipped"] == feed["checksNotRun"]
+    assert feed["coverage"]["total"] == feed["coverage"]["ran"] + feed["coverage"]["skipped"]
+
+
 def test_batch_markdown() -> None:
     result = invoke("batch", "--format", "markdown", E201, str(FIXTURES / "invalid" / "TODS-W101"))
     assert "# TODS fleet compliance report" in result.output
-    assert "| source | errors | warnings | infos | status |" in result.output
+    assert "| source | errors | warnings | infos | checks not run | status |" in result.output
     assert "| fail |" in result.output
     assert "| pass |" in result.output
     assert result.exit_code == 1
+
+
+def test_batch_markdown_discloses_fleet_wide_coverage() -> None:
+    # A TODS-only feed's row must carry its skip count beside "pass", and the
+    # roll-up must state the fleet's aggregate scope -- the same disclosure
+    # every single-feed format already carries (#127).
+    result = invoke("batch", "--format", "markdown", str(FIXTURES / "invalid" / "TODS-W101"))
+    assert "Rule-set coverage:" in result.output
+    lines = [line for line in result.output.splitlines() if line.startswith("| `")]
+    assert len(lines) == 1
+    # "| `source` | errors | warnings | infos | checks not run | status |"
+    cells = [c.strip() for c in lines[0].strip().strip("|").split("|")]
+    assert cells[-1] == "pass"
+    assert int(cells[-2]) > 0  # checks not run, right beside "pass"
+
+
+def test_batch_text_discloses_fleet_wide_coverage() -> None:
+    result = invoke("batch", str(FIXTURES / "invalid" / "TODS-W101"))
+    assert "not run" in result.output
+    assert "Rule-set coverage:" in result.output
+    data_line = next(line for line in result.output.splitlines() if "TODS-W101" in line)
+    assert int(data_line.split()[3]) > 0  # errors warnings infos "not run" source
+
+
+def test_batch_require_complete_run_fails_a_partial_feed() -> None:
+    # The GTFS reference rules are unrequested skips on this TODS-only feed
+    # (no --gtfs, no --ignore, no opt-out asked for), so --require-complete-run
+    # must fail it even though it has zero findings of its own.
+    without = invoke("batch", "--format", "json", str(FIXTURES / "invalid" / "TODS-W101"))
+    assert without.exit_code == 0  # a skip alone does not fail a feed by default
+    assert json.loads(without.output)["feeds"][0]["status"] == "pass"
+    with_flag = invoke(
+        "batch",
+        "--format",
+        "json",
+        "--require-complete-run",
+        str(FIXTURES / "invalid" / "TODS-W101"),
+    )
+    assert with_flag.exit_code == 1
+    assert json.loads(with_flag.output)["feeds"][0]["status"] == "fail"
 
 
 def test_batch_markdown_stamp() -> None:
@@ -126,6 +210,77 @@ def test_stats_text_and_json() -> None:
     # Operational profile additions.
     assert payload["files_present"]  # which files shipped
     assert len(payload["service_date_range"]) == 2  # [min, max] dated assignment
+
+
+def _tods_only_feed(directory: Path) -> Path:
+    """A TODS package with no file a TODS ID can resolve against."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "run_events.txt").write_text(
+        "service_id,run_id,event_sequence,event_type,trip_id,start_location,start_time,"
+        "end_location,end_time\nweekday,1,10,operator,T1,S1,09:00:00,S1,10:00:00\n"
+    )
+    (directory / "vehicles.txt").write_text("vehicle_id\nV1\n")
+    (directory / "vehicle_assignments.txt").write_text("date,block_id,vehicle_id\n20260101,B1,V1\n")
+    return directory
+
+
+def test_stats_does_not_treat_a_stray_gtfs_file_as_a_companion(tmp_path: Path) -> None:
+    # #187(a): `stats` selected its self-companion with the wide GTFS file set,
+    # so a stray agency.txt -- which no TODS ID resolves against -- produced a
+    # companion reporting 0 trips and 0 blocks, while `validate` on the same
+    # directory correctly reported no companion feed at all. The two commands
+    # have to agree, and the narrow set (GTFS_COMPANION_FILENAMES, runner.py)
+    # is the one that decides it.
+    feed = _tods_only_feed(tmp_path / "stray")
+    (feed / "agency.txt").write_text("agency_name,agency_url,agency_timezone\nA,http://a,UTC\n")
+
+    payload = json.loads(invoke("stats", str(feed), "--format", "json").output)
+    assert payload["gtfs_trips"] is None
+    assert payload["trip_coverage_pct"] is None
+    assert payload["gtfs_blocks"] is None
+
+    text = invoke("stats", str(feed)).output
+    assert "GTFS trips" not in text
+    assert "no companion GTFS feed was provided" in text
+    assert "None%" not in text
+
+
+def test_stats_does_not_read_trip_counts_off_a_supplement(tmp_path: Path) -> None:
+    # #187(a), the worse shape: a stray agency.txt admitted the package as its
+    # own companion, and the trip counts were then read off trips_supplement.txt
+    # -- a file that modifies trips.txt, so with no trips.txt there is nothing
+    # to resolve against. `stats` reported 100% trip coverage for a package with
+    # no trips.txt anywhere in the tree.
+    feed = _tods_only_feed(tmp_path / "supplement-only")
+    (feed / "agency.txt").write_text("agency_name,agency_url,agency_timezone\nA,http://a,UTC\n")
+    (feed / "trips_supplement.txt").write_text(
+        "supplement_type,trip_id,route_id,service_id\nadd,T1,R1,weekday\n"
+    )
+
+    payload = json.loads(invoke("stats", str(feed), "--format", "json").output)
+    assert payload["gtfs_trips"] is None
+    assert payload["trip_coverage_pct"] is None
+
+
+def test_stats_never_prints_none_percent_for_an_empty_companion(tmp_path: Path) -> None:
+    # #187(b): with a real --gtfs companion whose trips.txt is a header row and
+    # no data, trip_coverage_pct is None and the single-feed renderer printed
+    # it as "None%" -- the absence of a percentage, rendered as a reading. The
+    # cross-feed renderer already had the guard this one was missing.
+    feed = _tods_only_feed(tmp_path / "tods")
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir()
+    (gtfs / "trips.txt").write_text("trip_id,route_id,service_id\n")
+    (gtfs / "stops.txt").write_text("stop_id\nS1\n")
+
+    for fmt in ("text", "markdown"):
+        out = invoke("stats", str(feed), "--gtfs", str(gtfs), "--format", fmt).output
+        assert "None%" not in out
+        assert "Trip coverage" in out
+        assert "—" in out
+    payload = json.loads(invoke("stats", str(feed), "--gtfs", str(gtfs), "--format", "json").output)
+    assert payload["gtfs_trips"] == 0
+    assert payload["trip_coverage_pct"] is None
 
 
 def test_stats_markdown_profile() -> None:

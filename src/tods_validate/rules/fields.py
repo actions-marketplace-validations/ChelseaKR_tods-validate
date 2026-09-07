@@ -19,7 +19,7 @@ from ..schema import (
     TableSpec,
     spec_link,
 )
-from . import ValidationContext, rule
+from . import GTFS_TRIPS, ValidationContext, rule
 
 # GTFS Time: H:MM:SS or HH:MM:SS; hours may exceed 24 for service past midnight
 # and have no upper bound in the spec, so the hour field is not width-capped.
@@ -59,6 +59,17 @@ def _in_range(value: str, low: float, high: float) -> bool:
 def _is_non_negative(value: str) -> bool:
     number = _parse_decimal(value)
     return number is not None and number >= 0.0
+
+
+# GTFS reference, "Field Types > Color": "A color encoded as a six-digit
+# hexadecimal number... (the leading '#' must not be included)." The spec's
+# own examples ("FFFFFF", "000000", "0039A6") are uppercase but nothing in
+# the text restricts case, so both are accepted.
+_COLOR_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+
+
+def _is_valid_color(value: str) -> bool:
+    return _COLOR_RE.match(value) is not None
 
 
 def _tods_tables(context: ValidationContext) -> Iterator[tuple[TableSpec, FeedFile]]:
@@ -331,6 +342,7 @@ def duplicate_primary_key(context: ValidationContext) -> Iterator[Finding]:
     # companion GTFS (trips.txt). Without it the check cannot run, so depend on
     # GTFS rather than silently passing.
     needs_gtfs=True,
+    gtfs_tables=(GTFS_TRIPS,),
     # vehicle_assignments.txt does not exist in TODS v1.0.0 (added in v2.1.0).
     spec_versions=(SPEC_VERSION,),
 )
@@ -395,4 +407,53 @@ def padded_value(context: ValidationContext) -> Iterator[Finding]:
                         ),
                         suggestion="Remove the padding so IDs match exactly.",
                         data={"value": value, "field": name, "expected": value.strip()},
+                    )
+
+
+@rule(
+    id="TODS-E207",
+    severity=Severity.ERROR,
+    title="Value is not a valid color",
+    description=(
+        "A GTFS Color field is not six hexadecimal digits (0-9, A-F), with no leading "
+        "'#'. routes_supplement.txt's route_color and route_text_color inherit their "
+        "type from GTFS routes.txt; a value here becomes the effective color in the "
+        "TODS-Supplemented GTFS the same way a bad value in routes.txt itself would be "
+        "invalid, even though this file is not GTFS and this validator does not "
+        "otherwise re-check the base feed."
+    ),
+    spec_section=f"{SPEC_URL}#supplement-files",
+    example=(
+        "Before: `route_color` is `#FF0000` or `red`. After: six hex digits with no "
+        "leading `#` -- `FF0000`."
+    ),
+)
+def invalid_color(context: ValidationContext) -> Iterator[Finding]:
+    for table, feed in _tods_tables(context):
+        colored = [f for f in table.fields if f.type is FieldType.COLOR and f.name in feed.headers]
+        if not colored:
+            continue
+        for row in feed.rows:
+            for f in colored:
+                value = row.values.get(f.name, "")
+                if value == "":
+                    continue  # blank is fine; GTFS Color fields here are Optional
+                if not _is_valid_color(value):
+                    yield Finding(
+                        rule_id="TODS-E207",
+                        severity=Severity.ERROR,
+                        file=table.filename,
+                        row=row.line,
+                        field=f.name,
+                        message=(
+                            f"{table.filename} row {row.line}: {f.name} is {value!r}, which is "
+                            "not a valid color. Use six hexadecimal digits with no leading '#', "
+                            "e.g. 'FF0000'."
+                        ),
+                        suggestion=f"Remove the '#' and any non-hex characters from {f.name}.",
+                        data={
+                            "value": value,
+                            "field": f.name,
+                            "expected": "6 hex digits, e.g. FF0000",
+                        },
                     )

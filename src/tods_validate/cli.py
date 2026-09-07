@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, NoReturn
 import click
 
 from . import __version__
+from ._pkgio import UnreadableFileError
 from .anonymize import AlreadyProtectedError, anonymize_package
 from .baseline import diff_findings, load_baseline_identities
 from .config import PROFILES, Config, ConfigError, _merge, _profile_config, load_config
@@ -33,10 +34,18 @@ from .init import SHAPES, DestinationNotEmptyError
 from .init import scaffold as scaffold_package
 from .loader import Package, PackageNotFoundError, load_package
 from .merge import merge_feeds
-from .policy import GatingPolicy
+from .pickdiff import (
+    analyze_pickdiff,
+    anonymize_pickdiff,
+    pickdiff_to_dict,
+    render_pickdiff_markdown,
+    render_pickdiff_text,
+)
+from .policy import EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE, GatingPolicy
 from .report import (
     RENDERERS,
     render_batch_markdown,
+    render_batch_text,
     render_github,
     render_html,
     render_json,
@@ -46,7 +55,7 @@ from .report import (
     summarize,
 )
 from .rules import CATEGORIES, RunCoverage, all_rules, render_rule_detail
-from .runner import run, run_with_coverage
+from .runner import run_with_coverage
 from .schema import SPEC_VERSION, SUPPORTED_SPEC_VERSIONS
 from .stats import (
     collect_cross_stats,
@@ -73,7 +82,7 @@ if TYPE_CHECKING:
 
 def _fail(message: str) -> NoReturn:
     click.echo(f"tods-validate: error: {message}", err=True)
-    sys.exit(2)
+    sys.exit(EXIT_USAGE)
 
 
 def _resolve_config(config_path: str | None) -> Config:
@@ -174,8 +183,7 @@ def _render(
             spec_version=spec_version,
             timeline_package=package if timeline else None,
         )
-    # github annotations carry no manifest; coverage is disclosed by the other formats.
-    return render_github(findings, source)
+    return render_github(findings, source, coverage=coverage)
 
 
 class _DefaultToValidate(click.Group):
@@ -274,6 +282,15 @@ def main() -> None:
     help="A previous JSON report; only findings new since it affect the exit code.",
 )
 @click.option(
+    "--require-complete-run",
+    is_flag=True,
+    help=(
+        "Also fail when a check could not run because an input was missing, such as "
+        "a companion GTFS feed that was not given. Skips you asked for (--ignore, "
+        "opt-in rules left off, --spec-version scoping) still exit 0."
+    ),
+)
+@click.option(
     "--max-findings",
     type=int,
     default=None,
@@ -323,6 +340,7 @@ def validate(  # noqa: C901 -- pragmatic complexity; ratchet tracked in docs/CON
     profile: str | None,
     spec_version: str | None,
     baseline_path: str | None,
+    require_complete_run: bool,
     max_findings: int | None,
     quiet: bool,
     suggest: bool,
@@ -366,7 +384,7 @@ def validate(  # noqa: C901 -- pragmatic complexity; ratchet tracked in docs/CON
     _check_rule_ids(tuple(policy.ignore))
     severity_remap = dict(config.severity_remap)
 
-    def _validate_once() -> list[Finding]:
+    def _validate_once() -> tuple[list[Finding], RunCoverage]:
         package, found, coverage = run_with_coverage(
             path,
             gtfs_path,
@@ -408,7 +426,7 @@ def validate(  # noqa: C901 -- pragmatic complexity; ratchet tracked in docs/CON
 
             click.echo("")
             click.echo(render_suggestions(suggest_for_findings(gate.kept, package), output_format))
-        return gate.kept
+        return gate.kept, coverage
 
     if watch:
         from .watch import watch as watch_feed
@@ -424,11 +442,11 @@ def validate(  # noqa: C901 -- pragmatic complexity; ratchet tracked in docs/CON
         try:
             watch_feed(path, _tick)
         except KeyboardInterrupt:
-            sys.exit(0)
+            sys.exit(EXIT_CLEAN)
         return
 
     try:
-        findings = _validate_once()
+        findings, coverage = _validate_once()
     except PackageNotFoundError as exc:
         _fail(str(exc))
     _write_github_outputs(findings)
@@ -436,8 +454,23 @@ def validate(  # noqa: C901 -- pragmatic complexity; ratchet tracked in docs/CON
     # The exit code considers only findings new since the baseline, if given
     # (policy.apply already filtered `findings` for --ignore, so re-running it
     # here just applies the baseline narrowing on top of the same kept list).
+    #
+    # A skipped check does not by itself change the exit code. That is a
+    # deliberate choice, not an oversight: this tool has shipped as a merge
+    # gate since 0.1.0, and every feed validated without a companion GTFS feed
+    # skips 16 checks, so failing on a skip would turn those pipelines red on
+    # an upgrade for something they never asked the tool to promise. The
+    # report says what did not run instead, in every format, and
+    # --require-complete-run is how a pipeline opts in to gating on it.
     gate = policy.apply(findings)
-    sys.exit(1 if gate.failed else 0)
+    incomplete = coverage.unrequested_skips if require_complete_run else ()
+    if incomplete:
+        click.echo(
+            f"tods-validate: --require-complete-run: {len(incomplete)} check(s) could not "
+            f"run because an input was missing: {', '.join(o.id for o in incomplete)}.",
+            err=True,
+        )
+    sys.exit(EXIT_FINDINGS if gate.failed or incomplete else EXIT_CLEAN)
 
 
 @main.command()
@@ -480,6 +513,14 @@ def diff(
     Reports which findings were fixed, newly introduced, or still present, so a
     change to a feed can be reviewed for regressions. Honors the same
     --config/--ignore/--fail-on policy as validate.
+
+    A finding present in OLD and absent from NEW is only reported "fixed"
+    when its rule actually ran in NEW. A rule that stopped running (a
+    dropped or newly unreadable companion GTFS feed, most often) also makes
+    its old findings disappear, but that is not evidence anything was fixed
+    -- see #126 -- so those land in a separate "unknown" bucket instead, and
+    any rule that ran in OLD but not in NEW is named, whether or not it had
+    findings to lose.
     """
     config = _resolve_config(config_path)
     policy = GatingPolicy.from_config(fail_on=fail_on, config=config, ignore_ids=ignore_ids)
@@ -487,18 +528,23 @@ def diff(
     severity_remap = dict(config.severity_remap)
 
     try:
-        _, old_findings = run(old, gtfs_path, severity_remap=severity_remap)
-        _, new_findings_list = run(new, gtfs_path, severity_remap=severity_remap)
+        _, old_findings, old_coverage = run_with_coverage(
+            old, gtfs_path, severity_remap=severity_remap
+        )
+        _, new_findings_list, new_coverage = run_with_coverage(
+            new, gtfs_path, severity_remap=severity_remap
+        )
     except PackageNotFoundError as exc:
         _fail(str(exc))
 
     old_kept = policy.apply(old_findings).kept
     new_kept = policy.apply(new_findings_list).kept
-    result = diff_findings(old_kept, new_kept)
+    result = diff_findings(old_kept, new_kept, new_coverage=new_coverage)
     click.echo(f"tods-validate diff: {old} -> {new}")
     click.echo(
         f"  fixed: {len(result.fixed)}, introduced: {len(result.introduced)}, "
-        f"persisting: {len(result.persisting)}, moved: {len(result.moved)}"
+        f"persisting: {len(result.persisting)}, moved: {len(result.moved)}, "
+        f"unknown: {len(result.unknown)}"
     )
     for finding in result.introduced:
         loc = finding.location()
@@ -521,9 +567,112 @@ def diff(
             if loc
             else f"  ~ {finding.rule_id} {finding.message}"
         )
+    for finding in result.unknown:
+        loc = finding.location()
+        click.echo(
+            f"  ? {finding.rule_id} [{loc}] {finding.message} (rule did not run in NEW)"
+            if loc
+            else f"  ? {finding.rule_id} {finding.message} (rule did not run in NEW)"
+        )
+
+    # Rules that ran in OLD and not in NEW, named even when they had nothing
+    # to lose: a companion GTFS dropped between OLD and NEW can zero out 16
+    # checks with 0 findings on either side, which the counts line above
+    # would otherwise report as a silently clean diff (#126, same class as
+    # #124's "clean report understates its own scope").
+    regressed_ids = {o.id for o in old_coverage.ran} - {o.id for o in new_coverage.ran}
+    if regressed_ids:
+        regressed = RunCoverage(tuple(o for o in new_coverage.outcomes if o.id in regressed_ids))
+        click.echo(
+            f"  {len(regressed_ids)} rule(s) that ran in OLD do not run in NEW "
+            "(their old findings, if any, are 'unknown' above, not 'fixed'):"
+        )
+        for line in regressed.skipped_detail_lines():
+            click.echo(f"    {line}")
 
     gate = policy.apply(result.introduced)
-    sys.exit(1 if gate.failed else 0)
+    sys.exit(EXIT_FINDINGS if gate.failed else EXIT_CLEAN)
+
+
+@main.command()
+@click.argument("old", type=click.Path(exists=False))
+@click.argument("new", type=click.Path(exists=False))
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["text", "json", "markdown"]),
+    default="text",
+    show_default=True,
+)
+@click.option(
+    "--anonymize",
+    "anonymize_output",
+    is_flag=True,
+    default=False,
+    help=(
+        "Pseudonymize employee and vehicle identifiers in the report, so it can "
+        "be shared. One salt per run, applied to both sides."
+    ),
+)
+@click.option(
+    "--spec-version",
+    "spec_version",
+    default=None,
+    help=f"TODS spec version whose file inventory and primary keys to use. Default {SPEC_VERSION}.",
+)
+@click.option("--encoding", default=None)
+def pickdiff(
+    old: str,
+    new: str,
+    output_format: str,
+    anonymize_output: bool,
+    spec_version: str | None,
+    encoding: str | None,
+) -> None:
+    """Compare two TODS packages by primary key: OLD then NEW.
+
+    Answers "what changed in the operational data", which neither `diff` (which
+    compares findings) nor `drift` (which compares a companion GTFS feed) does.
+    Runs added and removed, rows added, removed and changed with their old and
+    new values, events changed per run, and the revenue/non-revenue minutes
+    delta. No findings are produced and no change is judged correct.
+
+    Rows are matched on the spec's primary key for each file, so reordering a
+    file is not a difference. A duplicate primary key is reported, never merged.
+    A file that could not be read is named as NOT COMPARED, never reported as a
+    file whose rows were all deleted.
+
+    Exits 1 when something changed, 0 when nothing did, and 2 when the
+    comparison could not be completed: a package that will not load, a file
+    inside one that could not be read, or a duplicate primary key whose later
+    rows were matched against nothing. None of those establishes whether the
+    pick changed, and reporting one as a clean diff would count a check that
+    could not run as a check that passed.
+    """
+    effective_spec = spec_version or SPEC_VERSION
+    _check_spec_version(effective_spec)
+    try:
+        old_package = load_package(old, encoding=encoding)
+        new_package = load_package(new, encoding=encoding)
+    except PackageNotFoundError as exc:
+        _fail(str(exc))
+
+    report = analyze_pickdiff(old_package, new_package, spec_version=effective_spec)
+    if anonymize_output:
+        report = anonymize_pickdiff(report)
+    if output_format == "json":
+        click.echo(json.dumps(pickdiff_to_dict(report), indent=2))
+    elif output_format == "markdown":
+        click.echo(render_pickdiff_markdown(report))
+    else:
+        click.echo(render_pickdiff_text(report))
+    # An incomplete comparison is not a clean one. A file that could not be
+    # read, or one holding a duplicate primary key whose later rows were
+    # matched against nothing, leaves the question unanswered, and 0 would
+    # answer it.
+    if report.incomplete:
+        sys.exit(EXIT_USAGE)
+    sys.exit(EXIT_FINDINGS if report.has_changes else EXIT_CLEAN)
 
 
 @main.command()
@@ -580,7 +729,7 @@ def drift(
         click.echo(render_drift_markdown(report))
     else:
         click.echo(render_drift_text(report))
-    sys.exit(1 if report.has_breaks else 0)
+    sys.exit(EXIT_FINDINGS if report.has_breaks else EXIT_CLEAN)
 
 
 @main.command()
@@ -598,6 +747,16 @@ def drift(
     type=click.Choice(["error", "warning"]),
     default=None,
     help="Exit non-zero if any feed has findings at or above this severity.  [default: error]",
+)
+@click.option(
+    "--require-complete-run",
+    is_flag=True,
+    help=(
+        "Also fail a feed when a check could not run because an input was missing, "
+        "such as a companion GTFS feed that was not given. Skips a feed asked for "
+        "(--ignore, opt-in rules left off) still leave it passing. See validate's "
+        "flag of the same name."
+    ),
 )
 @click.option(
     "--stamp",
@@ -640,6 +799,7 @@ def batch(
     gtfs_path: str | None,
     output_format: str,
     fail_on: str | None,
+    require_complete_run: bool,
     stamp: bool,
     ignore_ids: tuple[str, ...],
     history_dir: str | None,
@@ -658,47 +818,63 @@ def batch(
     severity_remap = dict(config.severity_remap)
 
     rows: list[dict[str, object]] = []
+    coverages: list[RunCoverage | None] = []
     any_failed = False
     for path in paths:
         try:
-            package, findings = run(path, gtfs_path, severity_remap=severity_remap)
+            package, findings, coverage = run_with_coverage(
+                path, gtfs_path, severity_remap=severity_remap
+            )
         except PackageNotFoundError as exc:
             rows.append({"source": path, "error": str(exc)})
+            coverages.append(None)
             any_failed = True
             continue
         gate = policy.apply(findings)
         counts = gate.counts
+        # A skipped check does not by itself fail a feed here either (see the
+        # matching comment on validate's exit code): --require-complete-run is
+        # how a fleet run opts in to that. What batch must never do is publish
+        # status: pass on a partial run without saying so -- every row below
+        # carries checksNotRun/coverage beside it regardless of this flag
+        # (#127); this only decides whether an incomplete run also fails.
+        incomplete = coverage.unrequested_skips if require_complete_run else ()
+        failed = gate.failed or bool(incomplete)
         rows.append(
             {
                 "source": package.source,
                 "errors": counts.get(Severity.ERROR, 0),
                 "warnings": counts.get(Severity.WARNING, 0),
                 "infos": counts.get(Severity.INFO, 0),
-                "status": "fail" if gate.failed else "pass",
+                "status": "fail" if failed else "pass",
+                "checksNotRun": len(coverage.skipped),
+                "coverage": coverage.to_dict(),
             }
         )
-        if gate.failed:
+        coverages.append(coverage)
+        if failed:
             any_failed = True
         if effective_history is not None:
+            # The same `coverage` that produced this row's checksNotRun goes
+            # into the durable record. The table disclosed the partial run and
+            # the ledger written in the same breath did not, and the ledger is
+            # the one read months later (#186).
             record = build_record(
-                gate.kept, package.source, tool_version=__version__, spec_version=SPEC_VERSION
+                gate.kept,
+                package.source,
+                tool_version=__version__,
+                spec_version=SPEC_VERSION,
+                coverage=coverage,
             )
             append_record(Path(effective_history), record)
 
     if output_format == "json":
         click.echo(json.dumps({"feeds": rows}, indent=2))
     elif output_format == "markdown":
-        click.echo(render_batch_markdown(rows, stamp=stamp))
+        click.echo(render_batch_markdown(rows, coverages, stamp=stamp))
     else:
-        click.echo(f"{'errors':>7} {'warnings':>9} {'infos':>6}  source")
-        for row in rows:
-            if "error" in row:
-                click.echo(f"{'-':>7} {'-':>9} {'-':>6}  {row['source']} ({row['error']})")
-            else:
-                click.echo(
-                    f"{row['errors']:>7} {row['warnings']:>9} {row['infos']:>6}  {row['source']}"
-                )
-    sys.exit(1 if any_failed else 0)
+        click.echo(render_batch_text(rows, coverages))
+    sys.exit(EXIT_FINDINGS if any_failed else EXIT_CLEAN)
 
 
 @main.command()
@@ -833,6 +1009,8 @@ def anonymize(
         _fail(str(exc))
     except AlreadyProtectedError as exc:
         _fail(str(exc))
+    except UnreadableFileError as exc:
+        _fail(str(exc))
     for target, count in sorted(result.replacements.items()):
         click.echo(f"{target}: {count} value(s) pseudonymized")
     click.echo(f"Wrote {len(result.written)} file(s) to {output_path}.")
@@ -869,7 +1047,13 @@ def fix(path: str, output_path: str | None, encoding: str | None) -> None:
         result = fix_package(path, Path(output_path) if output_path is not None else None, encoding)
     except PackageNotFoundError as exc:
         _fail(str(exc))
+    except UnreadableFileError as exc:
+        _fail(str(exc))
     click.echo(f"tods-validate fix: {result.source}")
+    for name in result.unreadable:
+        # Said before the "Nothing to fix." line, which otherwise reads as
+        # "this package is fine" when a file in it was never read.
+        click.echo(f"  {name}: could not be read; not analyzed and not fixable (see TODS-E103)")
     if not result.changed_any:
         click.echo("  Nothing to fix.")
         return
@@ -1019,6 +1203,15 @@ def merge(path: str, gtfs_path: str | None, output_path: str, manifest: bool) ->
     default=None,
     help="Exit non-zero if validate findings reach this severity.  [default: error]",
 )
+@click.option(
+    "--require-complete-run",
+    is_flag=True,
+    help=(
+        "Also fail when a check could not run because an input was missing, such as "
+        "a companion GTFS feed that was not given. Skips you asked for (opt-in rules "
+        "left off, --spec-version scoping) still exit 0."
+    ),
+)
 def doctor(
     path: str,
     gtfs_path: str | None,
@@ -1027,6 +1220,7 @@ def doctor(
     encoding: str | None,
     stamp: bool,
     fail_on: str | None,
+    require_complete_run: bool,
 ) -> None:
     """Run validate, merge, gtfs-validator, and stats as one pass on PATH.
 
@@ -1065,7 +1259,20 @@ def doctor(
     validator_stage = report.stage("gtfs-validator")
     if validator_stage is not None and validator_stage.status == "failed":
         failed = True
-    sys.exit(1 if failed else 0)
+
+    # Same contract as validate and batch: a skipped check does not change the
+    # exit code by itself, and --require-complete-run is how a pipeline opts in
+    # to gating on one. doctor is the command that composes the whole pipeline,
+    # so it was the one place the flag could not be reached (#185).
+    coverage = validate_payload.coverage if isinstance(validate_payload, ValidatePayload) else None
+    incomplete = coverage.unrequested_skips if (require_complete_run and coverage) else ()
+    if incomplete:
+        click.echo(
+            f"tods-validate: --require-complete-run: {len(incomplete)} check(s) could not "
+            f"run because an input was missing: {', '.join(o.id for o in incomplete)}.",
+            err=True,
+        )
+    sys.exit(EXIT_FINDINGS if failed or incomplete else EXIT_CLEAN)
 
 
 @main.command(name="rules")
@@ -1089,6 +1296,10 @@ def rules_command(output_format: str) -> None:
                 "description": r.description,
                 "specSection": r.spec_section,
                 "needsGtfs": r.needs_gtfs,
+                # Which companion GTFS files the rule reads. Each inner list is
+                # a set of alternatives; the rule is skipped
+                # ("skipped:needs_gtfs_table") unless every group is satisfied.
+                "gtfsTables": [list(group) for group in r.gtfs_tables],
                 "category": r.category,
                 "defaultEnabled": r.default_enabled,
                 "interpretation": r.interpretation,

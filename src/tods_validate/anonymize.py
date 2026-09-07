@@ -32,7 +32,7 @@ import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ._pkgio import serialize_feed, write_package
+from ._pkgio import reject_unreadable, serialize_feed, write_package
 from .loader import load_package
 from .schema import TABLES, FieldType
 
@@ -40,7 +40,9 @@ _VEHICLE_PREFIX = "veh"
 
 # Field types whose values are structured/enumerated rather than free text, so
 # they are not reported as a residual re-identification risk even when left
-# unpseudonymized (e.g. a NON_NEGATIVE_INTEGER sequence number).
+# unpseudonymized (e.g. a NON_NEGATIVE_INTEGER sequence number). COLOR (route
+# branding hex) is included for the same reason: a six-hex-digit color does
+# not identify a person.
 _STRUCTURED_TYPES = frozenset(
     {
         FieldType.ID,
@@ -48,6 +50,7 @@ _STRUCTURED_TYPES = frozenset(
         FieldType.NON_NEGATIVE_INTEGER,
         FieldType.DATE,
         FieldType.TIME,
+        FieldType.COLOR,
     }
 )
 
@@ -62,9 +65,25 @@ class AnonymizeResult:
     carried_through: list[tuple[str, str]] = field(default_factory=list)
 
 
-def _pseudonym(prefix: str, value: str, salt: str) -> str:
+def pseudonym(prefix: str, value: str, salt: str) -> str:
     digest = hashlib.sha256(f"{salt}:{prefix}:{value}".encode()).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+#: The (file, field) pairs this module pseudonymizes by default, and the prefix
+#: each gets. Module-level rather than local to :func:`anonymize_package` so
+#: another surface that needs to pseudonymize the same identifiers -- the
+#: semantic package diff's ``--anonymize``, which pseudonymizes values inside a
+#: report rather than writing a package -- protects exactly this set and cannot
+#: drift into protecting a smaller one. ``vehicle_id`` is shared between
+#: vehicles.txt and vehicle_assignments.txt so the assignment still resolves.
+PROTECTED_FIELD_PREFIXES: dict[tuple[str, str], str] = {
+    ("employee_run_dates.txt", "employee_id"): "emp",
+    ("vehicles.txt", "license_plate"): "plate",
+    ("vehicles.txt", "vehicle_label"): "vlbl",
+    ("vehicles.txt", "vehicle_id"): _VEHICLE_PREFIX,
+    ("vehicle_assignments.txt", "vehicle_id"): _VEHICLE_PREFIX,
+}
 
 
 def _derive_prefix(field_name: str) -> str:
@@ -109,17 +128,13 @@ def anonymize_package(  # noqa: C901 - the pseudonymization pass tracks several 
     """
     salt = salt if salt is not None else secrets.token_hex(8)
     package = load_package(path, encoding=encoding)
+    # An unreadable file has no headers and no rows, so it would be written out
+    # empty *and* omitted from the "carried through unprotected" table -- the
+    # disclosure this command exists to make would be silently incomplete.
+    reject_unreadable(package.files, "anonymize")
     result = AnonymizeResult()
 
-    # vehicle_id is pseudonymized consistently across vehicles.txt and
-    # vehicle_assignments.txt so the assignment still resolves.
-    field_prefix: dict[tuple[str, str], str] = {
-        ("employee_run_dates.txt", "employee_id"): "emp",
-        ("vehicles.txt", "license_plate"): "plate",
-        ("vehicles.txt", "vehicle_label"): "vlbl",
-        ("vehicles.txt", "vehicle_id"): _VEHICLE_PREFIX,
-        ("vehicle_assignments.txt", "vehicle_id"): _VEHICLE_PREFIX,
-    }
+    field_prefix: dict[tuple[str, str], str] = dict(PROTECTED_FIELD_PREFIXES)
     default_protected = frozenset(field_prefix)
 
     also_pairs: list[tuple[str, str]]
@@ -164,7 +179,7 @@ def anonymize_package(  # noqa: C901 - the pseudonymization pass tracks several 
             values = dict(row.values)
             for col, prefix in sensitive.items():
                 if values.get(col, ""):
-                    values[col] = _pseudonym(prefix, values[col], salt)
+                    values[col] = pseudonym(prefix, values[col], salt)
                     counts[col] += 1
             rows.append(values)
         for col, count in counts.items():

@@ -1,10 +1,72 @@
 name: Deploy playground
 
-# Publishes web/ (the in-browser Pyodide validator) to GitHub Pages.
-# One-time setup: Settings -> Pages -> Source: "GitHub Actions". Then run this
-# workflow manually. Kept on workflow_dispatch so it never deploys unverified.
+# Publishes web/ (the in-browser Pyodide validator, its README, the share card,
+# the rule catalog index and 43 per-rule pages -- 47 files) to GitHub Pages.
+# One-time setup: Settings -> Pages -> Source: "GitHub Actions".
+#
+# Runs as the last stage of a release, called from pypi-publish.yml after
+# `verify-published` has confirmed the released wheel is really on PyPI. It
+# used to run on `release: published` directly, which raced the very upload it
+# depends on: the page micropip-installs `tods-validate==<pinned>` from PyPI,
+# and on v0.8.0 and v0.9.0 the guard below fired seconds after the release was
+# published -- correctly refusing a page whose wheel did not exist yet -- so
+# the live playground stayed on the previous release. Sequencing the deploy
+# after the publish removes the race; the guard stays, so a wheel PyPI never
+# serves still fails this workflow loudly instead of deploying anyway or
+# silently skipping. workflow_dispatch stays for out-of-band fixes (deploys
+# main, whose pin the guard checks against PyPI the same way).
+#
+# The push trigger below is new, and it closes the gap that made `live
+# integrity sentinel` structurally red. Everything in this repository that
+# looks at the deployment compares it with the DEFAULT BRANCH: the sentinel
+# checks out `main` and diffs all 47 published files against it daily, and
+# scripts/check-deployed-playground.sh records at length why the release tag
+# is the wrong oracle (a tag is not what a dispatch deploys, and an immutable
+# tag that shipped a stale pin held that check red for days against a
+# deployment that was correct -- #142). So the repository asserts the site
+# tracks main. Nothing deployed main when main changed. Every successful
+# deploy in this workflow's history has been a workflow_dispatch; #174
+# established there had never been a push trigger, and that "every release
+# since the sequencing landed has depended on a person noticing".
+#
+# The bill came due on #176, which gave web/index.html and every catalog page
+# an og:image and added web/og-card.png. The last deploy was the manual
+# dispatch of 80e5f9b on 2026-09-02, so 46 of the 47 published files went stale
+# in one commit, and og-card.png -- the share card those new tags advertise --
+# has 404ed on the live site ever since, which is the exact failure #176 added
+# tests to prevent. The sentinel has been red on every run since, and green
+# exactly once in eight, the morning after someone remembered to dispatch. A
+# daily check that only a person can clear is not a drift detector; it is an
+# alarm with no off switch. This makes the deploy follow main, so that red
+# means drift.
+#
+# This does not weaken the release property, because that property was never
+# enforced by the trigger. It is enforced by the pin guard below: the page
+# micropip-installs `tods-validate==<pin>` and this workflow refuses to publish
+# a page whose pin PyPI does not serve. main only ever names a released wheel
+# -- the release checklist deliberately leaves the pin at the previous release
+# for the whole staging window (#171, waived as WVR-003) and repins only after
+# the wheel is live -- so the push route publishes current main pinned to a
+# real release, which is what the release route publishes too, just sooner.
+#
+# The paths filter is exactly the tree `upload-pages-artifact` uploads, plus
+# this file, so a push that changes nothing published deploys nothing. If those
+# two ever drift apart, the sentinel is what notices -- the same backstop that
+# caught the missing trigger.
+#
+# The verify job below then checks that the deployment actually took effect,
+# that the deployed page really boots and validates a feed, and that it passes
+# WCAG 2.1 AA -- a deploy is not done because a job went green, it is done when
+# the page people open is the page that was built and it works.
+# .github/workflows/playground-deployment.yml re-runs all three checks weekly.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/pages.yml"
+  workflow_call:
   workflow_dispatch:
 
 # Least-privilege default; the deploy job escalates only what it needs
@@ -12,16 +74,19 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
   deploy:
+    # Serialize page deploys. Job-level rather than workflow-level so the
+    # group holds both when this workflow is called from pypi-publish.yml and
+    # when it is dispatched directly.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       pages: write # publish the built site to GitHub Pages
       id-token: write # OIDC to prove this workflow run produced the artifact
@@ -29,9 +94,78 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+      - name: Refuse to publish a page pinned to a wheel PyPI does not have
+        env:
+          ATTEMPTS: "20" # x 30s: 10 minutes for the index to settle
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/.*TODS_VALIDATE_VERSION = "\([^"]*\)".*/\1/p' web/index.html | head -1)"
+          test -n "$pin"
+          echo "playground pins tods-validate==$pin"
+          # The retry absorbs index propagation right after a publish (the
+          # release path has already re-downloaded the wheel in
+          # verify-published, but this workflow can also be dispatched on its
+          # own). A wheel that never appears still fails, loudly, after the
+          # window -- never deploy a page that cannot install itself, and
+          # never skip quietly.
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if curl -fsSL -o /dev/null "https://pypi.org/pypi/tods-validate/$pin/json"; then
+              echo "PyPI serves tods-validate==$pin (attempt $attempt/$ATTEMPTS)"
+              exit 0
+            fi
+            echo "attempt $attempt/$ATTEMPTS: PyPI does not serve tods-validate==$pin yet; waiting 30s"
+            sleep 30
+          done
+          echo "::error::PyPI has no tods-validate==$pin after $ATTEMPTS attempts, so the deployed page could not install itself. Publish the wheel first (pypi-publish.yml), then re-run this deploy."
+          exit 1
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: web
       - id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+  # Confirms the deployment against the live URL: the served page must be the
+  # tree that was just uploaded, and it must pass the same WCAG 2.1 AA runners
+  # ci.yml applies to the repository copy.
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    # 20, not 15: the boot check below can spend several minutes waiting on
+    # Pyodide and micropip. Its own timeouts are shorter, so a real failure
+    # reports the page's last status rather than being killed with the job.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      # Deliberately no actions/setup-node: this workflow deploys as part of
+      # a release publish, and zizmor's cache-poisoning audit blocks a
+      # cache-capable setup action in that context. The runner's preinstalled
+      # Node runs pa11y-ci fine, and `npm ci` installs from the committed
+      # lockfile either way.
+      - run: node --version
+      - run: npm ci --ignore-scripts
+      - name: Check the deployed page is the tree that was just published
+        run: ./scripts/check-deployed-playground.sh web/index.html
+      - name: Select the hosted Chrome binary
+        run: |
+          a11y_chrome="$(command -v google-chrome)"
+          test -x "$a11y_chrome"
+          echo "PUPPETEER_EXECUTABLE_PATH=$a11y_chrome" >> "$GITHUB_ENV"
+      # The step above proves the right bytes are being served and the step
+      # below proves they render accessibly with Pyodide switched off. Neither
+      # opens the playground the way a person does. This one does: it waits for
+      # micropip to install the pinned wheel from PyPI and runs two fixtures
+      # through it, a broken one that must report its rule and the valid one
+      # that must report nothing, so a release cannot report a green deploy of
+      # a page that cannot install itself, or of one that answers every feed
+      # alike.
+      - name: Boot the deployed page and validate a broken and a clean feed through it
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/.*TODS_VALIDATE_VERSION = "\([^"]*\)".*/\1/p' web/index.html | head -1)"
+          test -n "$pin"
+          PLAYGROUND_EXPECTED_PIN="$pin" node scripts/check-playground-boots.cjs
+      - name: Audit the deployed page (WCAG 2.1 AA)
+        run: ./node_modules/.bin/pa11y-ci --config scripts/pa11y-ci-live.cjs

@@ -4,6 +4,12 @@ Planned direction for tods-validate. Dates are intentions, not promises;
 items move earlier when users ask for them. Feedback and feature requests
 are welcome as GitHub issues.
 
+This file is version-keyed and stays the product roadmap.
+[`MULTIYEAR-PLAN.md`](MULTIYEAR-PLAN.md) sequences what is left of it into
+phases across roughly 2026 to 2029, alongside the standards and stewardship
+work that has no version number attached, and is honest about which parts are
+gated on other people rather than on engineering.
+
 ## v0.2.0 — Suppression and reporting (shipped 2026-06-12)
 
 - `--ignore TODS-Wxxx` (repeatable) and a `tods-validate.toml` config file so
@@ -32,7 +38,9 @@ are welcome as GitHub issues.
   metadata) and a published JSON Schema for the report format, so dashboards
   can consume findings without scraping text.
 - A pre-commit hook definition.
-- `scripts/benchmark.py` for throughput on large synthetic feeds.
+- `scripts/benchmark.py` for throughput on large synthetic feeds, and
+  `scripts/check_perf_budget.py`, which turns that measurement into a CI gate
+  against `perf/baseline.json`.
 - SARIF and HTML report formats; richer text/Markdown (by-rule grouping,
   root-cause hints, path-to-green).
 - `diff`, `batch`, `stats`, and `anonymize` subcommands; a `merge` manifest.
@@ -81,7 +89,7 @@ described above.
 
 Per `docs/standards/QUALITY-AND-METRICS-STANDARD.md`'s per-repo Metrics
 table: project-specific values here, rigor cited to the owning standard.
-Updated 2026-07-05.
+Updated 2026-08-27.
 
 | Metric | Target | Measured by | Gate | Owner |
 |---|---|---|---|---|
@@ -94,11 +102,28 @@ Updated 2026-07-05.
 | Secrets in tree/history | 0 | gitleaks (pre-commit + CI) | AUTO | Chelsea Kelly-Reif |
 | Container CVEs (CRITICAL/HIGH) | 0 | Trivy in `docker.yml` | AUTO | Chelsea Kelly-Reif |
 | Rule ↔ fixture parity | 1:1 | `tests/test_conformance.py` | AUTO | Chelsea Kelly-Reif |
-| Mutation kill-rate (rules engine) | ≥ 70% (ratchet; baseline ~65%) | `mutmut` (advisory, weekly) | REVIEW | Chelsea Kelly-Reif |
-| axe/pa11y violations (HTML report + playground) | 0 | `make a11y` (axe + HTML_CodeSniffer, WCAG 2.1 AA) | AUTO | Chelsea Kelly-Reif |
-| Perf regression budget | ≤ 2x baseline | `scripts/benchmark.py`, not yet a CI gate | N/A-not-yet-built | Chelsea Kelly-Reif |
+| Mutation kill-rate (rules engine) | ≥ 70% (ratchet; floor 60%, measured 62.2% on 2026-08-27) | `mutmut` weekly + `scripts/check_mutation_ratchet.py` vs `perf/mutation-baseline.json` | AUTO (below floor) | Chelsea Kelly-Reif |
+| axe/pa11y violations (HTML report, playground, rule catalog) | 0 | `make a11y` (axe + HTML_CodeSniffer, WCAG 2.1 AA) | AUTO | Chelsea Kelly-Reif |
+| Perf regression budget | ≤ 2x baseline (rows per CPU-second) | `make perf-check` (`perf` job in `ci.yml`) vs `perf/baseline.json` | AUTO | Chelsea Kelly-Reif |
+| Peak memory per input byte | ≤ 1.03x baseline (30.90x measured) | `make memory-check` vs `perf/baseline.json` | AUTO | Chelsea Kelly-Reif |
+| Shipped HTML byte budget | per-surface ceilings, incl. a 10,000-finding report | `scripts/check_bundle_budget.py` vs `perf/bundle-baseline.json` | AUTO | Chelsea Kelly-Reif |
 | Screen-reader walkthrough | per release | not yet committed as an artifact | REVIEW-not-yet-built | Chelsea Kelly-Reif |
 | Threat model | per new surface | `SECURITY.md`, updated ad hoc | REVIEW | Chelsea Kelly-Reif |
+| Data-card presence | 1:1 with the declared source list | `scripts/check_data_cards.py` (DG-01) | AUTO | Chelsea Kelly-Reif |
+| Incident-response contract | labels declared, postmortems complete, no wildcard staging | `scripts/check_incident_contract.py` (IR-05/07/15/16/17) | AUTO | Chelsea Kelly-Reif |
+| DORA delivery health | reviewed quarterly, never fabricated | `scripts/delivery_metrics.py` → `docs/DORA-<year>-Q<n>.md` (QM-11) | REVIEW quarterly | Chelsea Kelly-Reif |
+| Revert rate | counterweight to throughput | `scripts/delivery_metrics.py` (ADM-09) | BASELINE, graduation decision 2026-11-30 | Chelsea Kelly-Reif |
+| Unreviewed-merge rate | counterweight to throughput | `scripts/delivery_metrics.py` (ADM-08) | BASELINE, graduation decision 2026-11-30 | Chelsea Kelly-Reif |
+
+`AI-DEV-MEASUREMENT: APPLIES` (per
+`docs/standards/AI-DEVELOPMENT-MEASUREMENT-STANDARD.md` section 8). Development
+of this repository is AI-assisted; 32 of 160 commits on `main` carry a
+`Co-Authored-By: Claude` trailer as of 2026-08-27. That share is a **diagnostic
+signal and never gates**, per that standard's section 2, which also puts
+acceptance rate, lines of code, and self-reported speedup permanently out of
+gating scope. The counterweights are the two BASELINE rows above, and each
+carries a dated graduation decision because a BASELINE row without one is a
+conformance failure in its own right.
 
 Rows marked "not-yet-built" are honest gaps, not silent omissions; see
 `docs/CONFORMANCE-GAPS.md` for the open item each maps to.

@@ -27,6 +27,9 @@
     "TODS-E205",
     "TODS-I501"
   ],
+  "invalid/TODS-E207": [
+    "TODS-E207"
+  ],
   "invalid/TODS-E301": [
     "TODS-E301"
   ],
@@ -65,8 +68,7 @@
     "TODS-I501"
   ],
   "invalid/TODS-E314": [
-    "TODS-E314",
-    "TODS-I501"
+    "TODS-E314"
   ],
   "invalid/TODS-E401": [
     "TODS-E401"
@@ -95,11 +97,17 @@
   "invalid/TODS-I601": [
     "TODS-I601"
   ],
+  "invalid/TODS-I602": [
+    "TODS-I602"
+  ],
   "invalid/TODS-W101": [
     "TODS-W101"
   ],
   "invalid/TODS-W107": [
     "TODS-W107"
+  ],
+  "invalid/TODS-W109": [
+    "TODS-W109"
   ],
   "invalid/TODS-W206": [
     "TODS-W206"
