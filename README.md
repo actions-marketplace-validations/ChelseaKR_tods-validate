@@ -212,6 +212,21 @@ resolves to exactly the same settings as `strict`; it is a separate name
 because the two answer different questions, and a later change to one should
 not silently move the other.
 
+An agency can also write down its own operational limits, such as the longest
+spread or the shortest break its labour agreement allows, in a `[policy]` table
+in the same file. They run as `LOCAL-` rules, only when the table sets them, and
+every finding they produce says it is agency policy rather than the TODS
+specification. See [docs/local-policy.md](docs/local-policy.md).
+
+A downstream system deciding whether to import a feed can take the answer as a
+file it can check: `tods-validate handoff exports/tods --gtfs exports/gtfs
+--profile ingest-ready --out handoff.json` writes a record carrying the SHA-256
+of every file, the settings the decision was made under, what did and did not
+run, and the decision itself. `tods-validate handoff verify handoff.json
+exports/tods --gtfs exports/gtfs` re-hashes the files and recomputes the
+decision, so the receiver checks the record rather than trusting it. See
+[docs/handoff.md](docs/handoff.md).
+
 Some checks are off by default because they surface judgement calls rather than
 spec violations. Turn them on with `--enable coverage` (which GTFS trips have no
 run event; which blocks have no vehicle) or `--enable advisory` (e.g. long runs
@@ -262,7 +277,7 @@ package first so the merge rests on clean inputs.
 A CI job that checks the merged feed with MobilityData's gtfs-validator:
 
 ```yaml
-- uses: ChelseaKR/tods-validate@v0.10.0
+- uses: ChelseaKR/tods-validate@v0.11.0
   with:
     path: feed/tods
     gtfs: feed/gtfs
@@ -403,7 +418,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ChelseaKR/tods-validate@v0.10.0
+      - uses: ChelseaKR/tods-validate@v0.11.0
         with:
           path: feed/tods
           gtfs: feed/gtfs        # omit if GTFS files sit next to the TODS files
@@ -415,6 +430,16 @@ request include the checks that did not run and why (see
 out is the case worth knowing about: the 17 checks that read GTFS files cannot
 run, 9 of them ERROR-severity, and the job still passes. Add
 `require-complete-run: "true"` to fail it instead.
+
+**Pin an exact release**, as above, or a 40-character commit SHA — there is no
+`@v0` or `@v0.11` to pin to, deliberately. A major-only ref on a 0.x project
+promises a stability the version scheme does not offer: between v0.5.0 and
+v0.11.0 the minimum Python rose from 3.11 to 3.12, four rules were added, and
+`require-complete-run` came into existence. It is also the ref that quietly goes
+stale, since nothing fails when it stops moving —
+[`SECURITY.md`](SECURITY.md#supply-chain) asks you to pin by commit SHA or image
+digest rather than a moving tag for exactly that reason, and `make docs-check`
+fails if any example here names a ref that is not the current release.
 
 The action installs `tods-validate` from a hash-verified
 [`requirements-action.lock`](requirements-action.lock) (`pip install

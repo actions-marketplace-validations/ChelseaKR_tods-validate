@@ -135,6 +135,11 @@ CATEGORIES = ("core", "coverage", "advisory", "experimental", "feasibility")
 SPEC_NAMESPACE = "TODS-"
 OPERATIONAL_NAMESPACE = "OPS-"
 
+# What a renderer prints beside a citation that is not the TODS specification.
+# One string, so `explain`, editor hovers, docs/rules.md and the published rule
+# pages cannot word it four different ways. See cites_spec().
+NOT_A_SPEC_REQUIREMENT = "Not a TODS specification requirement."
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -827,6 +832,19 @@ def render_example_text(example: RuleExample) -> list[str]:
     return lines
 
 
+def cites_spec(rule_def: Rule) -> bool:
+    """Whether ``rule_def``'s citation is a section of the TODS specification.
+
+    Only TODS- rules cite the spec, and tests/test_registry.py enforces both
+    directions of that. Every renderer that labels a citation asks this rather
+    than calling every citation "the spec": an OPS- rule's citation is the ADR
+    that decided it, and printing "TODS specification" beside that link tells a
+    feed producer the standard requires something it does not say. That is the
+    misrepresentation the separate namespace exists to prevent (ADR 0008).
+    """
+    return rule_def.id.startswith(SPEC_NAMESPACE)
+
+
 def render_rule_detail(rule_def: Rule, fmt: str = "text") -> str:
     """Full rule detail — id, severity, title, description, spec citation,
     interpretation note, and a worked example — as plain text or Markdown.
@@ -845,7 +863,10 @@ def render_rule_detail(rule_def: Rule, fmt: str = "text") -> str:
         ]
         if rule_def.interpretation:
             lines += ["", f"_Interpretation:_ {rule_def.interpretation}"]
-        lines += ["", f"[TODS specification]({rule_def.spec_section})"]
+        if cites_spec(rule_def):
+            lines += ["", f"[TODS specification]({rule_def.spec_section})"]
+        else:
+            lines += ["", f"{NOT_A_SPEC_REQUIREMENT} [Decision record]({rule_def.spec_section})"]
         if example is not None:
             lines += ["", *render_example_markdown(example)]
         return "\n".join(lines)
@@ -857,7 +878,10 @@ def render_rule_detail(rule_def: Rule, fmt: str = "text") -> str:
     ]
     if rule_def.interpretation:
         lines += ["", f"Interpretation: {rule_def.interpretation}"]
-    lines += ["", f"Spec: {rule_def.spec_section}"]
+    if cites_spec(rule_def):
+        lines += ["", f"Spec: {rule_def.spec_section}"]
+    else:
+        lines += ["", f"{NOT_A_SPEC_REQUIREMENT} Decision record: {rule_def.spec_section}"]
     if example is not None:
         lines += ["", *render_example_text(example)]
     return "\n".join(lines)
@@ -897,6 +921,11 @@ _STATUS_REASON = {
 # discloses anything, so the complete case states itself rather than staying
 # silent.
 ALL_CHECKS_RAN = "Every applicable check ran"
+
+# The heading of the local-policy band. It names whose rules these are in the
+# same breath as counting them, because the band sits directly under the line
+# describing this project's own rule set and must never read as part of it.
+LOCAL_BAND = "Local policy (agency thresholds, not the TODS specification)"
 
 # The skips the invocation did not ask for. --ignore, opt-in rules left off,
 # and --spec-version scoping are all choices the caller made; a missing (or
@@ -977,6 +1006,10 @@ class RuleOutcome:
     # None for rules that either did not run or examine the package as a
     # whole rather than unit by unit. See Measurement.
     measurement: Measurement | None = None
+    # Set only on a LOCAL- outcome: the [policy] setting that configured the
+    # rule, as it reads in the table (e.g. "max-spread-minutes = 660"). None on
+    # every registry rule, whose serialised outcome it therefore never changes.
+    policy_setting: str | None = None
 
     @property
     def ran(self) -> bool:
@@ -997,6 +1030,13 @@ class RunCoverage:
     """
 
     outcomes: tuple[RuleOutcome, ...]
+    # The agency's LOCAL- rules, one per configured [policy] setting, evaluated
+    # outside the registry (local_policy.py, ADR 0009). Empty unless a policy
+    # was loaded. The accessors that describe this project's rule set --
+    # scope_line, skipped_by_reason, the totals in to_dict -- read `outcomes`
+    # only: the statement of what the spec checks covered does not change
+    # because an agency added rules of its own.
+    local: tuple[RuleOutcome, ...] = ()
 
     @property
     def ran(self) -> tuple[RuleOutcome, ...]:
@@ -1011,9 +1051,13 @@ class RunCoverage:
         """Rules that could not run because an input was missing.
 
         Distinct from :attr:`skipped`, which also counts the skips the caller
-        asked for. See UNREQUESTED_SKIP_STATUSES.
+        asked for. See UNREQUESTED_SKIP_STATUSES. A configured local rule that
+        could not run for want of an input is included: the agency asked for
+        it, so it is a check this run wanted to make and could not.
         """
-        return tuple(o for o in self.outcomes if o.status in UNREQUESTED_SKIP_STATUSES)
+        return tuple(
+            o for o in (*self.outcomes, *self.local) if o.status in UNREQUESTED_SKIP_STATUSES
+        )
 
     def skipped_by_reason(self) -> dict[str, list[RuleOutcome]]:
         """Skipped rules grouped by status, in a stable status order.
@@ -1038,17 +1082,19 @@ class RunCoverage:
         if not ignore:
             return self
         ignore = set(ignore)
-        return RunCoverage(
-            tuple(
+        # replace(), not a new RunCoverage: that would drop the local band.
+        return replace(
+            self,
+            outcomes=tuple(
                 replace(o, status=STATUS_SKIPPED_IGNORED) if o.ran and o.id in ignore else o
                 for o in self.outcomes
-            )
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
         """The additive ``coverage`` block emitted in the JSON report."""
         skipped = self.skipped
-        return {
+        payload: dict[str, object] = {
             "total": len(self.outcomes),
             "ran": len(self.ran),
             "skipped": len(skipped),
@@ -1056,21 +1102,17 @@ class RunCoverage:
                 status: [o.id for o in members]
                 for status, members in self.skipped_by_reason().items()
             },
-            "rules": [
-                {
-                    "id": o.id,
-                    "severity": o.severity.name,
-                    "category": o.category,
-                    "status": o.status,
-                    **(
-                        {"measurement": o.measurement.to_dict()}
-                        if o.measurement is not None
-                        else {}
-                    ),
-                }
-                for o in self.outcomes
-            ],
+            "rules": [_outcome_dict(o) for o in self.outcomes],
         }
+        # Only when a policy was loaded, so a report without one carries
+        # exactly the keys it always has.
+        if self.local:
+            payload["localPolicy"] = {
+                "total": len(self.local),
+                "ran": sum(1 for o in self.local if o.ran),
+                "rules": [_outcome_dict(o) for o in self.local],
+            }
+        return payload
 
     def measurement_lines(self) -> list[str]:
         """One line per rule that reported a partial measurement. Never silent.
@@ -1087,6 +1129,32 @@ class RunCoverage:
             for o in self.outcomes
             if o.measurement is not None and o.measurement.unmeasurable
         ]
+
+    def local_lines(self) -> list[str]:
+        """The local-policy band: a line for the band, then one per configured rule.
+
+        Empty when no policy was loaded, so a report without one is unchanged.
+        Unlike :meth:`measurement_lines`, which lists only partial
+        measurements, every configured rule gets a line here, including one
+        that measured nothing: an agency reading a clean report needs to see
+        which of its own rules were applied, at what limit, and to how much.
+        """
+        if not self.local:
+            return []
+        ran = sum(1 for o in self.local if o.ran)
+        lines = [f"{LOCAL_BAND}: {ran} of {len(self.local)} ran."]
+        for o in self.local:
+            label = f"{o.id} ({o.policy_setting})" if o.policy_setting else o.id
+            m = o.measurement
+            if not o.ran:
+                lines.append(f"{label}: not run, {_STATUS_REASON[o.status]}.")
+            elif m is None:
+                lines.append(f"{label}: ran.")
+            elif m.total == 0 and m.reason:
+                lines.append(f"{label}: 0 {m.unit}s measured ({m.reason}).")
+            else:
+                lines.append(f"{label}: {m.summary()}")
+        return lines
 
     def summary_line(self) -> str | None:
         """One line disclosing skipped checks, or None when everything ran."""
@@ -1132,6 +1200,18 @@ class RunCoverage:
             ids = ", ".join(o.id for o in members)
             lines.append(f"Not run, {_STATUS_REASON[status]} ({severities}): {ids}")
         return lines
+
+
+def _outcome_dict(o: RuleOutcome) -> dict[str, object]:
+    """One rule's entry in the JSON coverage block. Key order is part of the output."""
+    return {
+        "id": o.id,
+        "severity": o.severity.name,
+        "category": o.category,
+        "status": o.status,
+        **({"measurement": o.measurement.to_dict()} if o.measurement is not None else {}),
+        **({"policySetting": o.policy_setting} if o.policy_setting is not None else {}),
+    }
 
 
 def rule(
@@ -1272,6 +1352,8 @@ __all__ = [
     "ALL_CHECKS_RAN",
     "DEFAULT_MAX_IMPLIED_SPEED_KPH",
     "EXAMPLES",
+    "LOCAL_BAND",
+    "NOT_A_SPEC_REQUIREMENT",
     "OPERATIONAL_NAMESPACE",
     "REGISTRY",
     "SPEC_NAMESPACE",
@@ -1283,6 +1365,7 @@ __all__ = [
     "RuleExample",
     "ValidationContext",
     "all_rules",
+    "cites_spec",
     "example_for",
     "render_example_markdown",
     "render_example_text",

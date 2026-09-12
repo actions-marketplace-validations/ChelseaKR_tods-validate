@@ -7,6 +7,87 @@ new checks may be added in minor releases.
 
 Added:
 
+- `tods-validate conformance run`: a harness that runs any validator over the
+  published conformance corpus and reports, per fixture, whether it agrees with
+  `expectations.json`. The corpus has been downloadable for months so that
+  another implementation could be checked against it; "run it and diff the
+  result" was left to each reader, and this is that step done once. Each
+  fixture is a subprocess with `{path}` substituted into a command template
+  that is split into a word list first (so a path with a space stays one
+  argument, and no shell is involved), and the rule identifiers are read back
+  out of that command's own output through a declared adapter. Text, Markdown
+  and JSON output; the Markdown is intended for the TODS Board thread.
+
+  **An adapter that reads nothing reports `unreadable`, never `agrees`.** That
+  is the whole design constraint. The `valid` fixture's expected rule set is
+  empty, so a reader pointed at the wrong stream would agree with it by
+  accident and publish a green row earned by a failure to read — this project's
+  own "absence rendered as a value" defect, in the tool built to compare
+  measurements. A `json` adapter separates the two structurally: `{"findings":
+  []}` has the array, and a document without it does not. A `regex` adapter
+  cannot, so it is required to declare `no_findings_pattern` — what the tool
+  prints when it is happy — and output matching neither expression is
+  unreadable.
+
+  Three exit codes rather than two: `0` only when every fixture was compared
+  and every comparison agreed, `1` when some fixture disagreed, `2` when any
+  fixture could not be compared at all. A command that hangs is reported as
+  timed out for **that fixture only**, because a hang on one input says nothing
+  about the others. Every report names the corpus digest it ran against, and
+  states how many fixtures were compared as well as how many agreed.
+
+  Nothing here judges which side of a disagreement is right; a disagreement is
+  a question about one implementation or about the spec text, which is the
+  signal the corpus exists to give. Measured against tods-validate itself at
+  0.11.0: 47 of 47 fixtures compared, 47 agree. Two adapters ship as worked
+  examples in `examples/conformance-adapters/`, and the test suite loads the
+  one for this project's own report rather than retyping it.
+
+- A `[policy]` table in `tods-validate.toml`, for the limits an agency's
+  labour agreement sets and the TODS spec cannot: worked time, piece length,
+  minimum break, spread, consecutive days per employee, and a vehicle on every
+  day a revenue event operates. They are checked as `LOCAL-P001` to
+  `LOCAL-P006`, each finding quotes the limit in force and ends by saying it is
+  agency policy, not the specification, and severity is set beside the limit.
+  [#189](https://github.com/ChelseaKR/tods-validate/issues/189)
+
+  With no `[policy]` table nothing reaches this code: no band in the coverage
+  manifest, no conformance fixture, no catalog page, and every report is
+  unchanged. With one, the manifest gains a separate local band stating each
+  configured rule's denominator, zero and unmeasurable included, and the JSON
+  report an optional `coverage.localPolicy` block.
+
+  Breaks are declared, never guessed. The spec lets a producer name event types
+  freely, so `max-run-minutes` and `min-break-minutes` refuse to load without
+  `break-event-types`, and a `break-event-types` that neither reads is refused
+  too. A limit of zero or less, a fraction, or an unknown setting stops the run
+  with exit 2 rather than being adjusted. See
+  [docs/local-policy.md](docs/local-policy.md) and
+  [ADR 0009](docs/adr/0009-local-policy-rules.md), which records why these take
+  a third namespace instead of the `OPS-` that ADR 0008 expected.
+
+- `tods-validate handoff FEED --gtfs GTFS --out handoff.json`: a go/no-go
+  record bound to the bytes it describes, and `tods-validate handoff verify
+  RECORD FEED` to check one offline. The record carries the SHA-256 of every
+  file in the package and its companion, the settings resolved rather than the
+  profile's name, the coverage manifest, the merge manifest with a digest of
+  each file the merge writes, and the decision with the rule IDs behind it.
+  [#197](https://github.com/ChelseaKR/tods-validate/issues/197)
+
+  A decision of `accept` needs two things: nothing at or above the settings'
+  `fail-on`, and every check that wanted an input got one. A record made
+  without a companion GTFS feed is therefore a reject however clean the feed
+  is, because its seventeen reference checks never ran.
+
+  The record carries no timestamp, so `verify` recomputes it and compares
+  everything but the tool block: a record whose decision was left alone and
+  whose coverage was edited to hide a skipped check fails exactly as a flipped
+  decision does. It exits 0 when the record matches, 1 when re-running does not
+  reproduce it, and 2 when the bytes differ, the record cannot be read, or a
+  requested signature does not verify. Signing is `ssh-keygen -Y` under its own
+  namespace, so a release tag's signature cannot be replayed as a record's.
+  See [docs/handoff.md](docs/handoff.md).
+
 - `OPS-W001`, an opt-in check for whether a pick can actually be worked. It
   resolves each movement's endpoints to coordinates in the companion GTFS
   (after supplements), divides the great-circle distance by the time allowed,
@@ -84,6 +165,37 @@ Added:
 
 Fixed:
 
+- The GitHub Action and pre-commit examples taught a pin one release out of
+  date, and nothing could notice. `README.md` and `.pre-commit-hooks.yaml` both
+  named `v0.10.0` from the day `v0.11.0` shipped, which is the second time the
+  pre-commit example went stale (#137 bumped it off `v0.4.0` by hand). Both
+  name `v0.11.0` now, and `make docs-check` gained a third check,
+  `scripts/check_action_refs.py`, that fails when a documented pin is not the
+  version `pyproject.toml` declares — so the release that bumps the version is
+  the release that bumps the examples.
+
+  The same check refuses a major- or minor-only ref outright, whatever it
+  currently points at. This repository published exactly one: `v0`, a
+  lightweight tag at the `v0.5.0` release commit, which never moved and is
+  recorded as a stray in `docs/CONFORMANCE-GAPS.md`. Measured against the same
+  TODS-only package on 2026-09-12, `tods-validate --format github` — the only
+  format the composite action emits — printed `0 error(s), 0 warning(s), 0
+  info` and exited 0 at `v0`, while 16 of 43 checks had not run for want of a
+  companion GTFS feed, 9 of them ERROR-severity; `v0.11.0` prints `26 of 43
+  checks ran` plus a `::notice` naming every one of the 16. `v0.5.0` has no
+  `--require-complete-run` and no `require-complete-run` input, so the README's
+  own remedy, set against a stale moving ref, is an undeclared input that
+  GitHub warns about and runs past. Deleting the published `v0` ref is an owner
+  action and is not done here; the check covers what this repository teaches.
+
+  `README.md`'s Action section now says why there is no `@v0` to pin: on a 0.x
+  project a major-only ref promises a stability the version scheme does not
+  offer — between `v0.5.0` and `v0.11.0` the minimum Python rose from 3.11 to
+  3.12 and four rules were added — and `SECURITY.md` already asks consumers to
+  pin by commit SHA or digest rather than a moving tag. A 40-character SHA
+  passes the check; a SHA whose `# vX.Y.Z` comment names another release does
+  not, because the comment is the half a reader trusts.
+
 - The Node dependency audit (SEC-11) read one of the two npm projects in this
   repository. `npm audit` reports on the lockfile in its working directory and
   nothing else, and `scripts/check_npm_audit.py` ran it once at the root — so
@@ -118,6 +230,28 @@ Fixed:
   in the accessibility toolchain — and must not accept the same advisory
   somewhere it says nothing about. A `tree:` naming a directory with no
   lockfile fails the gate, so a waiver cannot outlive the project it describes.
+
+- The JSON report schema refused every report in which `OPS-W001` ran.
+  `docs/report.schema.json` still admitted only `TODS-` rule IDs and did not
+  describe the per-rule `measurement` block, so a report from
+  `--enable feasibility` over any feed whose companion GTFS has a `stops.txt`
+  failed validation against the schema this project publishes for it, whether
+  or not the rule found anything. Neither shape has been released. The schema
+  now admits `OPS-` IDs and describes `measurement`, including the rule that a
+  non-zero unmeasurable count carries its reason. Suggestions stay `TODS-`
+  only, because every suggestion generator belongs to a `TODS-` rule.
+
+  The two tests that met this schema with a real report both ran with every
+  opt-in category off, which is where new report content arrives first. Each
+  rule's fixture is now validated with every opt-in category on: 47 reports,
+  where there were 2. Run against the unmodified schema, that test failed on
+  exactly the six fixtures that carry a `stops.txt`.
+
+- `explain`, editor hovers, `docs/rules.md` and the published rule page all
+  labelled `OPS-W001`'s citation, which is ADR 0008, as the TODS specification
+  (`Spec:`, `[TODS specification]`, `Spec reference:`). A rule outside the
+  `TODS-` namespace now reads "Not a TODS specification requirement. Decision
+  record:" before its link. Every `TODS-` rule renders exactly as it did.
 
 - `scripts/generate_rules_doc.py` grouped rules into catalog bands by a single
   digit and silently skipped any rule that matched no band. A rule in a new
@@ -251,6 +385,29 @@ Fixed:
 
   WVR-001 now matches nothing, and `make npm-audit` says so in its own output;
   it is left in place, unexpired, for the maintainer to retire.
+
+- Five comments describing the published site stated a page count, and all
+  five were wrong. The site is the playground, its README, the share card,
+  the rule catalog index and one page per rule: 46 rule pages and 50 tracked
+  files under `web/` today. `pages.yml` said "43 per-rule pages -- 47 files"
+  and "all 47 published files", `live-integrity.yml` "44 per-rule reference
+  pages ... those 46 files", `check-deployed-tree.sh` "today is 46 files ...
+  44 per-rule reference pages", `run-a11y.sh` "44 pages deployed", and two
+  comments in `tests/test_generate_rules_doc.py` "44 pages".
+
+  Nothing was unenforced. Every assertion is derived — the stylesheet check
+  compares `len(pages)` with `len(all_rules()) + 1`, the deployment sentinel
+  walks `git ls-files web`, and the two documents that state the count to a
+  reader, `docs/a11y/STATEMENT.md` and `docs/CONFORMANCE-GAPS.md`, are gated
+  against the generator by `test_the_prose_that_counts_the_published_pages_counts_them_right`
+  and are correct. The five that were wrong are exactly the five nobody
+  gated, which is the more useful half of the measurement.
+
+  They now describe the shape rather than a number. A sixth gate was not
+  added on purpose: the count is already checked where it is a published
+  claim, and requiring five more edits every time a rule lands would make
+  adding a rule a documentation exercise. No behaviour, output or gate
+  changes here.
 
 Changed:
 

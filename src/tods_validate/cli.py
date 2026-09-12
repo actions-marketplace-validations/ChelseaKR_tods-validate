@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -20,6 +21,18 @@ from ._pkgio import UnreadableFileError
 from .anonymize import AlreadyProtectedError, anonymize_package
 from .baseline import diff_findings, load_baseline_identities
 from .config import PROFILES, Config, ConfigError, _merge, _profile_config, load_config
+from .conformance import (
+    DEFAULT_TIMEOUT_SECONDS,
+    DISAGREES,
+    AdapterError,
+    CorpusError,
+    conformance_to_dict,
+    load_adapter,
+    load_corpus,
+    render_conformance_markdown,
+    render_conformance_text,
+    run_conformance,
+)
 from .doctor import (
     ValidatePayload,
     doctor_to_dict,
@@ -30,9 +43,19 @@ from .doctor import (
 from .drift import analyze_drift, drift_to_dict, render_drift_markdown, render_drift_text
 from .findings import Finding, Severity
 from .fix import fix_package
+from .handoff import (
+    ACCEPT,
+    HandoffSettings,
+    render_record,
+    sign_record,
+    verify_record,
+    verify_signature,
+)
+from .handoff import build_record as build_handoff_record
 from .init import SHAPES, DestinationNotEmptyError
 from .init import scaffold as scaffold_package
 from .loader import Package, PackageNotFoundError, load_package
+from .local_policy import LOCAL_NAMESPACE, LOCAL_RULES_BY_ID, as_rule
 from .merge import merge_feeds
 from .pickdiff import (
     analyze_pickdiff,
@@ -54,7 +77,7 @@ from .report import (
     render_text,
     summarize,
 )
-from .rules import CATEGORIES, RunCoverage, all_rules, render_rule_detail
+from .rules import CATEGORIES, Rule, RunCoverage, all_rules, render_rule_detail
 from .runner import run_with_coverage
 from .schema import SPEC_VERSION, SUPPORTED_SPEC_VERSIONS
 from .stats import (
@@ -98,6 +121,12 @@ def _resolve_config(config_path: str | None) -> Config:
 def _check_rule_ids(ignore: tuple[str, ...]) -> None:
     known = {r.id for r in all_rules()}
     unknown = sorted(set(ignore) - known)
+    local = [rule_id for rule_id in unknown if rule_id.startswith(LOCAL_NAMESPACE)]
+    if local:
+        _fail(
+            f"cannot ignore {', '.join(local)}: a LOCAL- rule is the agency's own [policy] "
+            "setting. Remove the setting from the [policy] table instead."
+        )
     if unknown:
         _fail(
             f"unknown rule ID(s) in ignore list: {', '.join(unknown)}. "
@@ -108,6 +137,12 @@ def _check_rule_ids(ignore: tuple[str, ...]) -> None:
 def _check_enable(enable: tuple[str, ...]) -> None:
     known = {r.id for r in all_rules()} | set(CATEGORIES)
     unknown = sorted(set(enable) - known)
+    local = [token for token in unknown if token.startswith(LOCAL_NAMESPACE)]
+    if local:
+        _fail(
+            f"cannot --enable {', '.join(local)}: a LOCAL- rule runs when its [policy] "
+            "setting is present in tods-validate.toml, not through --enable."
+        )
     if unknown:
         _fail(
             f"unknown --enable token(s): {', '.join(unknown)}. Use a rule ID or a "
@@ -393,6 +428,7 @@ def validate(  # noqa: C901 -- pragmatic complexity; ratchet tracked in docs/CON
             severity_remap=severity_remap,
             spec_version=effective_spec,
             max_implied_speed_kph=config.max_implied_speed_kph,
+            local_policy=config.local_policy,
         )
         gate = policy.apply(found)
         if gate.suppressed_ignored:
@@ -1285,34 +1321,59 @@ def doctor(
     show_default=True,
     help="Plain listing, or JSON for tooling.",
 )
-def rules_command(output_format: str) -> None:
-    """List every rule with its severity and description."""
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=False),
+    default=None,
+    help=(
+        "Configuration file whose [policy] table's LOCAL- rules are listed after the "
+        "registry. Without this option, a tods-validate.toml in the current directory "
+        "is used if present."
+    ),
+)
+def rules_command(output_format: str, config_path: str | None) -> None:
+    """List every rule with its severity and description.
+
+    LOCAL- rules follow, only when a config file sets them, with the limit and
+    severity that file gives them. They are an agency's own, so a build with no
+    [policy] table lists exactly what it always has.
+    """
     rules = sorted(all_rules(), key=lambda r: r.id.split("-")[1][1:])
+    policy = _resolve_config(config_path).local_policy
+    local = (
+        [(limit, as_rule(limit.rule, limit.severity)) for limit in policy.limits] if policy else []
+    )
     if output_format == "json":
-        payload = [
-            {
-                "id": r.id,
-                "severity": r.severity.name,
-                "title": r.title,
-                "description": r.description,
-                "specSection": r.spec_section,
-                "needsGtfs": r.needs_gtfs,
-                # Which companion GTFS files the rule reads. Each inner list is
-                # a set of alternatives; the rule is skipped
-                # ("skipped:needs_gtfs_table") unless every group is satisfied.
-                "gtfsTables": [list(group) for group in r.gtfs_tables],
-                "category": r.category,
-                "defaultEnabled": r.default_enabled,
-                "interpretation": r.interpretation,
-            }
-            for r in rules
-        ]
+        payload = [_rule_json(r) for r in rules]
+        payload += [{**_rule_json(r), "policySetting": limit.setting} for limit, r in local]
         click.echo(json.dumps(payload, indent=2))
         return
     for r in rules:
         needs = " (needs companion GTFS)" if r.needs_gtfs else ""
         optin = "" if r.default_enabled else f" (opt-in: --enable {r.category})"
         click.echo(f"{r.id}  {r.severity.name:7}  {r.title}{needs}{optin}")
+    for limit, r in local:
+        click.echo(f"{r.id}  {r.severity.name:7}  {r.title} (agency policy: {limit.setting})")
+
+
+def _rule_json(r: Rule) -> dict[str, object]:
+    """One rule's entry in ``rules --format json``. Key order is part of the output."""
+    return {
+        "id": r.id,
+        "severity": r.severity.name,
+        "title": r.title,
+        "description": r.description,
+        "specSection": r.spec_section,
+        "needsGtfs": r.needs_gtfs,
+        # Which companion GTFS files the rule reads. Each inner list is
+        # a set of alternatives; the rule is skipped
+        # ("skipped:needs_gtfs_table") unless every group is satisfied.
+        "gtfsTables": [list(group) for group in r.gtfs_tables],
+        "category": r.category,
+        "defaultEnabled": r.default_enabled,
+        "interpretation": r.interpretation,
+    }
 
 
 @main.command(name="explain")
@@ -1335,12 +1396,204 @@ def explain(rule_id: str, output_format: str) -> None:
     """
     known = {r.id: r for r in all_rules()}
     rule_def = known.get(rule_id)
+    if rule_def is None and rule_id in LOCAL_RULES_BY_ID:
+        # A LOCAL- rule is not registered, and explaining one needs no config:
+        # its definition is fixed, and only the limit is the agency's.
+        rule_def = as_rule(LOCAL_RULES_BY_ID[rule_id])
     if rule_def is None:
         _fail(
             f"unknown rule ID {rule_id!r}. Run `tods-validate rules` or see "
             "docs/rules.md for the rule catalog."
         )
     click.echo(render_rule_detail(rule_def, output_format))
+
+
+class _DefaultToCreate(click.Group):
+    """Route ``handoff FEED`` to ``handoff create FEED``.
+
+    The same arrangement as :class:`_DefaultToValidate`, one level down: a
+    first argument that is not a subcommand is the feed. A feed directory
+    literally named ``verify`` is created explicitly: ``handoff create verify/``.
+    """
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError:
+            return "create", self.get_command(ctx, "create"), args
+
+
+@main.group(name="handoff", cls=_DefaultToCreate)
+def handoff() -> None:
+    """Write or check a go/no-go record bound to the bytes it describes.
+
+    `tods-validate handoff FEED --out handoff.json` validates FEED and writes a
+    record carrying the SHA-256 of every file, the resolved settings, the
+    coverage and merge manifests, and the decision. `tods-validate handoff
+    verify handoff.json FEED` re-hashes the files and recomputes the record.
+    See docs/handoff.md.
+    """
+
+
+@handoff.command(name="create")
+@click.argument("path", type=click.Path(exists=False))
+@click.option(
+    "--gtfs",
+    "gtfs_path",
+    type=click.Path(exists=False),
+    default=None,
+    help=(
+        "Companion GTFS feed (directory or .zip). Omit if the GTFS files sit next to "
+        "the TODS files."
+    ),
+)
+@click.option(
+    "--out",
+    "out_path",
+    required=True,
+    type=click.Path(dir_okay=False),
+    help="Where to write the record (JSON).",
+)
+@click.option(
+    "--profile",
+    type=click.Choice(sorted(PROFILES)),
+    default=None,
+    help="The named preset the decision is made under, e.g. ingest-ready.",
+)
+@click.option(
+    "--spec-version",
+    default=None,
+    help=f"TODS spec version to validate against.  [default: {SPEC_VERSION}]",
+)
+@click.option(
+    "--encoding", default=None, help="Override UTF-8 decoding for non-conforming exports."
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=False),
+    default=None,
+    help=(
+        "Configuration file. Without this option, a tods-validate.toml in the "
+        "current directory is used if present."
+    ),
+)
+@click.option(
+    "--sign-key",
+    "sign_key",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Also write a detached SSH signature, <out>.sig, with this private key.",
+)
+def handoff_create(
+    path: str,
+    gtfs_path: str | None,
+    out_path: str,
+    profile: str | None,
+    spec_version: str | None,
+    encoding: str | None,
+    config_path: str | None,
+    sign_key: str | None,
+) -> None:
+    """Validate PATH and write a handoff record for it.
+
+    Exits 0 when the decision is accept and 1 when it is reject; the record is
+    written either way. Settings come from --profile and the config file, and
+    the record carries them resolved.
+    """
+    config = _resolve_config(config_path)
+    if profile is not None:
+        config = _merge(_profile_config(profile), config)
+    settings = HandoffSettings(
+        profile=profile or config.profile,
+        fail_on=config.fail_on or "error",
+        enable=tuple(sorted(set(config.enable))),
+        ignore=tuple(sorted(set(config.ignore))),
+        spec_version=spec_version or config.spec_version or SPEC_VERSION,
+        encoding=encoding or config.encoding,
+        severity_remap=tuple(sorted(config.severity_remap)),
+        max_implied_speed_kph=config.max_implied_speed_kph,
+    )
+    _check_enable(settings.enable)
+    _check_rule_ids(settings.ignore)
+    _check_spec_version(settings.spec_version)
+    try:
+        record = build_handoff_record(Path(path), Path(gtfs_path) if gtfs_path else None, settings)
+    except PackageNotFoundError as exc:
+        _fail(str(exc))
+    out = Path(out_path)
+    out.write_text(render_record(record), encoding="utf-8")
+    basis = record["decisionBasis"]
+    blocking = list(basis["blockingRules"]) if isinstance(basis, dict) else []
+    not_run = list(basis["checksNotRun"]) if isinstance(basis, dict) else []
+    click.echo(f"tods-validate handoff: decision {record['decision']} for {path}")
+    if blocking:
+        click.echo(f"  blocking rules: {', '.join(blocking)}")
+    if not_run:
+        click.echo(
+            f"  {len(not_run)} check(s) could not run because an input was "
+            f"missing: {', '.join(not_run)}"
+        )
+    click.echo(f"  wrote {out}")
+    if sign_key is not None:
+        try:
+            click.echo(f"  signed: {sign_record(out, Path(sign_key))}")
+        except (OSError, RuntimeError) as exc:
+            _fail(f"the record was written but could not be signed: {exc}")
+    sys.exit(EXIT_CLEAN if record["decision"] == ACCEPT else EXIT_FINDINGS)
+
+
+@handoff.command(name="verify")
+@click.argument("record_path", metavar="RECORD", type=click.Path(exists=False))
+@click.argument("path", type=click.Path(exists=False))
+@click.option(
+    "--gtfs",
+    "gtfs_path",
+    type=click.Path(exists=False),
+    default=None,
+    help="The companion GTFS feed, if the record was made with one.",
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Also verify RECORD.sig against this ssh-keygen allowed_signers file.",
+)
+@click.option("--signer", default=None, help="The identity RECORD.sig must be signed by.")
+def handoff_verify(
+    record_path: str,
+    path: str,
+    gtfs_path: str | None,
+    allowed_signers: str | None,
+    signer: str | None,
+) -> None:
+    """Check that RECORD describes the feed at PATH.
+
+    Exit 0: the record matches. Exit 1: re-running under the record's settings
+    does not reproduce it, for example because its decision was changed. Exit
+    2: the files differ from the ones it hashed, the record cannot be read, or
+    a requested signature does not verify.
+    """
+    if (allowed_signers is None) != (signer is None):
+        _fail("--allowed-signers and --signer go together: name the file and the identity.")
+    record = Path(record_path)
+    if allowed_signers is not None and signer is not None:
+        try:
+            refused = verify_signature(record, Path(allowed_signers), signer)
+        except (OSError, RuntimeError) as exc:
+            refused = str(exc)
+        if refused is not None:
+            click.echo(
+                f"tods-validate handoff verify: signature does not verify: {refused}", err=True
+            )
+            sys.exit(EXIT_USAGE)
+        click.echo(f"signature: verified for {signer}")
+    result = verify_record(record, Path(path), Path(gtfs_path) if gtfs_path else None)
+    for line in result.lines:
+        click.echo(line, err=result.exit_code == EXIT_USAGE)
+    sys.exit(result.exit_code)
 
 
 @main.command(name="init")
@@ -1372,6 +1625,107 @@ def init_command(dest: str, shape: str, force: bool) -> None:
     click.echo(f"tods-validate init: wrote {len(written)} file(s) to {dest}")
     for path in written:
         click.echo(f"  {path}")
+
+
+@main.group(name="conformance")
+def conformance_group() -> None:
+    """Compare another validator against the published conformance corpus."""
+
+
+@conformance_group.command(name="run")
+@click.option(
+    "--command",
+    "command",
+    required=True,
+    help=(
+        "The validator to run, with {path} where the fixture directory goes, e.g. "
+        '"other-validator --json {path}". Split as a shell word list; no shell is used.'
+    ),
+)
+@click.option(
+    "--corpus",
+    "corpus_path",
+    required=True,
+    type=click.Path(exists=True),
+    help=(
+        "The conformance corpus: the published zip, or a directory holding the same "
+        "fixtures and expectations.json."
+    ),
+)
+@click.option(
+    "--adapter",
+    "adapter_path",
+    required=True,
+    type=click.Path(exists=True),
+    help="JSON file describing how to read rule identifiers out of that validator's output.",
+)
+@click.option(
+    "--timeout",
+    default=DEFAULT_TIMEOUT_SECONDS,
+    show_default=True,
+    type=click.FloatRange(min=0, min_open=True),
+    help="Seconds one fixture may take before it is reported as timed out.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["text", "json", "markdown"]),
+    default="text",
+    show_default=True,
+)
+def conformance_run(
+    command: str,
+    corpus_path: str,
+    adapter_path: str,
+    timeout: float,
+    output_format: str,
+) -> None:
+    """Run a validator over every fixture and report where it disagrees.
+
+    The corpus is published so others can run it; this is the "and diff the
+    result against expectations.json" half, done once. Each fixture is executed
+    as its own subprocess, the rule identifiers are read back out of that
+    command's own output through the declared adapter, and the two sets are
+    compared.
+
+    Disagreements are listed with both sides. Nothing here judges which side is
+    right: a fixture where two implementations differ is a question about one of
+    them or about the spec text, which is the signal the corpus exists to give.
+
+    An adapter that cannot read a run reports that fixture as unreadable, never
+    as agreement — the empty rule set of a clean feed and the empty rule set of
+    an unread output are the same list, and telling them apart is the whole
+    point of the adapter format.
+
+    Exits 0 only when every fixture was compared and every comparison agreed,
+    1 when some fixture disagreed, and 2 when any fixture could not be compared
+    at all, because a corpus that was not fully run has not been passed.
+    """
+    try:
+        adapter = load_adapter(Path(adapter_path).read_text(encoding="utf-8"))
+    except (OSError, AdapterError) as exc:
+        _fail(str(exc))
+
+    with tempfile.TemporaryDirectory(prefix="tods-conformance-") as workdir:
+        try:
+            corpus = load_corpus(Path(corpus_path), Path(workdir))
+        except (OSError, CorpusError) as exc:
+            _fail(str(exc))
+        try:
+            report = run_conformance(command, adapter, corpus, timeout=timeout)
+        except ValueError as exc:
+            _fail(str(exc))
+
+    if output_format == "json":
+        click.echo(json.dumps(conformance_to_dict(report), indent=2))
+    elif output_format == "markdown":
+        click.echo(render_conformance_markdown(report))
+    else:
+        click.echo(render_conformance_text(report))
+
+    if report.unmeasured:
+        sys.exit(EXIT_USAGE)
+    sys.exit(EXIT_FINDINGS if report.count(DISAGREES) else EXIT_CLEAN)
 
 
 @main.command(name="lsp")
